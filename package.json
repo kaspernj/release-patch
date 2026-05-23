@@ -1,0 +1,37 @@
+{
+  "name": "release-patch",
+  "version": "1.0.0",
+  "description": "Bump the patch version, sync master, commit, push and publish an npm package with a single command.",
+  "type": "module",
+  "bin": {
+    "release-patch": "bin/release-patch.js"
+  },
+  "files": [
+    "bin"
+  ],
+  "scripts": {
+    "lint": "eslint \"bin/**/*.js\""
+  },
+  "keywords": [
+    "release",
+    "patch",
+    "version",
+    "publish",
+    "npm",
+    "automation"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kaspernj/release-patch.git"
+  },
+  "author": "kasper@diestoeckels.de",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/kaspernj/release-patch/issues"
+  },
+  "homepage": "https://github.com/kaspernj/release-patch#readme",
+  "devDependencies": {
+    "eslint": "^10.0.2",
+    "eslint-plugin-jsdoc": "^63.0.0"
+  }
+}
