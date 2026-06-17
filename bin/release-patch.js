@@ -3,8 +3,8 @@ import {execSync} from "node:child_process"
 import {existsSync, readFileSync} from "node:fs"
 import {resolve} from "node:path"
 
-// `preversion` runs before npm bumps package.json, so it cannot replace the release build.
-const releaseLifecycleScriptNames = ["version", "postversion", "prepublishOnly", "prepack", "prepare"]
+// `preversion` runs before the version bump, and publish hooks run after the push.
+const releaseLifecycleScriptNames = ["version", "postversion"]
 
 /** @param {string} command The shell command to run, inheriting stdio. */
 function run(command) {

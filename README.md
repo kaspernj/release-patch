@@ -11,14 +11,14 @@ When run from a package's root directory, it:
 1. Logs in to npm if you are not already authenticated (`npm login`).
 2. Syncs `master` with `origin/master` (`git checkout master`, `git fetch`, `git merge`).
 3. Bumps the patch version without creating a git tag (`npm version patch --no-git-tag-version`).
-4. Runs `npm run build` **only if** the package defines a `build` script and its release lifecycle scripts do not already run `build`.
+4. Runs `npm run build` **only if** the package defines a `build` script and its `version`/`postversion` lifecycle scripts do not already run `build`.
 5. Commits `package.json` and `package-lock.json` when present (`chore: bump patch version`).
 6. Pushes to `origin master`.
 7. Publishes to npm (`npm publish`).
 
 `npm version` already updates `package-lock.json` when present, so `release-patch` does not run `npm install`. This also avoids triggering `prepare` during install.
 
-`npm publish` still runs npm lifecycle scripts such as `prepublishOnly`, `prepack`, and `prepare`. If one of those scripts runs `build`, `release-patch` skips its own explicit `npm run build` to avoid adding another build on top of npm's lifecycle builds.
+`npm publish` still runs npm lifecycle scripts such as `prepublishOnly`, `prepack`, and `prepare`. Those hooks run after `release-patch` pushes the version commit, so they do not replace the pre-push build gate.
 
 ## Install
 

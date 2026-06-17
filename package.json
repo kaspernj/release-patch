@@ -10,8 +10,14 @@
     "bin"
   ],
   "scripts": {
-    "lint": "eslint \"bin/**/*.js\" \"tests/**/*.js\"",
-    "test": "node --test tests/*.test.js"
+    "all-checks": "npm run lint && npm test",
+    "test": "node --test tests/*.test.js",
+    "lint": "npm run eslint && npm run fallow && npm run typecheck",
+    "eslint": "eslint \"bin/**/*.js\" \"tests/**/*.js\"",
+    "fallow": "npm run fallow:audit",
+    "fallow:audit": "fallow audit --gate new-only",
+    "fallow:ci": "fallow audit --base origin/master --gate new-only --quiet",
+    "typecheck": "tsc --noEmit"
   },
   "keywords": [
     "release",
@@ -32,7 +38,10 @@
   },
   "homepage": "https://github.com/kaspernj/release-patch#readme",
   "devDependencies": {
+    "@types/node": "^25.0.0",
     "eslint": "^10.0.2",
-    "eslint-plugin-jsdoc": "^63.0.0"
+    "eslint-plugin-jsdoc": "^63.0.0",
+    "fallow": "^2.94.0",
+    "typescript": "^6.0.2"
   }
 }

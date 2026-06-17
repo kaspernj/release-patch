@@ -90,7 +90,13 @@ if (args[0] === "add" && args.includes("package-lock.json") && !existsSync(join(
 `
 }
 
-test("does not run an explicit build when release lifecycle scripts build", () => {
+/** @param {string[]} commands The command lines invoked by the CLI. */
+function assertSingleExplicitBuildAfterVersion(commands) {
+  assert.deepEqual(commands.filter((command) => command === "npm run build"), ["npm run build"])
+  assert.ok(commands.indexOf("npm version patch --no-git-tag-version") < commands.indexOf("npm run build"))
+}
+
+test("runs an explicit build when only publish lifecycle scripts build", () => {
   const commands = runReleasePatch(
     {
       scripts: {
@@ -102,8 +108,23 @@ test("does not run an explicit build when release lifecycle scripts build", () =
     {packageLock: true}
   )
 
-  assert.equal(commands.includes("npm run build"), false)
+  assert.deepEqual(commands.filter((command) => command === "npm run build"), ["npm run build"])
+  assert.ok(commands.indexOf("npm run build") < commands.indexOf("git push origin master"))
   assert.equal(commands.includes("npm install"), false)
+})
+
+test("does not run an explicit build when version lifecycle scripts build", () => {
+  const commands = runReleasePatch(
+    {
+      scripts: {
+        build: "tsc",
+        version: "npm run build"
+      }
+    },
+    {packageLock: true}
+  )
+
+  assert.equal(commands.includes("npm run build"), false)
 })
 
 test("runs one explicit build after bumping the version when no release lifecycle script builds", () => {
@@ -116,8 +137,7 @@ test("runs one explicit build after bumping the version when no release lifecycl
     {packageLock: true}
   )
 
-  assert.deepEqual(commands.filter((command) => command === "npm run build"), ["npm run build"])
-  assert.ok(commands.indexOf("npm version patch --no-git-tag-version") < commands.indexOf("npm run build"))
+  assertSingleExplicitBuildAfterVersion(commands)
   assert.equal(commands.includes("npm install"), false)
 })
 
@@ -132,8 +152,7 @@ test("runs an explicit build when only preversion builds", () => {
     {packageLock: true}
   )
 
-  assert.deepEqual(commands.filter((command) => command === "npm run build"), ["npm run build"])
-  assert.ok(commands.indexOf("npm version patch --no-git-tag-version") < commands.indexOf("npm run build"))
+  assertSingleExplicitBuildAfterVersion(commands)
 })
 
 test("does not require a package lock when none exists", () => {
