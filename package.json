@@ -10,7 +10,8 @@
     "bin"
   ],
   "scripts": {
-    "lint": "eslint \"bin/**/*.js\""
+    "lint": "eslint \"bin/**/*.js\" \"tests/**/*.js\"",
+    "test": "node --test tests/*.test.js"
   },
   "keywords": [
     "release",

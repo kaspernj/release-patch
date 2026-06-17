@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 import {execSync} from "node:child_process"
-import {readFileSync} from "node:fs"
+import {existsSync, readFileSync} from "node:fs"
 import {resolve} from "node:path"
+
+// `preversion` runs before npm bumps package.json, so it cannot replace the release build.
+const releaseLifecycleScriptNames = ["version", "postversion", "prepublishOnly", "prepack", "prepare"]
 
 /** @param {string} command The shell command to run, inheriting stdio. */
 function run(command) {
@@ -34,24 +37,50 @@ function ensureLatestMaster() {
   run("git merge origin/master")
 }
 
-const packageJson = readPackageJson()
+/**
+ * Checks whether a package script invokes the package's build script.
+ * @param {string | undefined} script The package script command to inspect.
+ * @returns {boolean} Whether the script invokes `build` through a package manager.
+ */
+function scriptRunsBuild(script) {
+  return /(?:^|[\s;&|()])(?:npm\s+(?:run(?:-script)?\s+)?|pnpm\s+(?:run\s+)?|yarn\s+(?:run\s+)?)build(?:$|[\s;&|)])/u.test(script ?? "")
+}
+
+/**
+ * Determines whether release-patch should run its own build command.
+ * @param {{scripts?: Record<string, string>}} packageJson The consuming package manifest.
+ * @returns {boolean} Whether release-patch should run `npm run build` explicitly.
+ */
+function shouldRunExplicitBuild(packageJson) {
+  return Boolean(packageJson.scripts?.build) && !releaseLifecycleScriptNames.some((scriptName) => {
+    return scriptRunsBuild(packageJson.scripts?.[scriptName])
+  })
+}
+
+/** Stages the files changed by the version bump. */
+function addVersionFiles() {
+  run("git add package.json")
+
+  if (existsSync(resolve(process.cwd(), "package-lock.json"))) {
+    run("git add package-lock.json")
+  }
+}
 
 ensureNpmAuth()
 ensureLatestMaster()
 
-// Build first if the consuming package defines a build script.
-if (packageJson.scripts?.build) {
-  run("npm run build")
-}
+const packageJson = readPackageJson()
 
 // Bump patch version without creating a git tag.
 run("npm version patch --no-git-tag-version")
 
-// Install dependencies so the lockfile reflects the new version.
-run("npm install")
+// Build after the version bump unless npm lifecycle scripts already do it.
+if (shouldRunExplicitBuild(packageJson)) {
+  run("npm run build")
+}
 
 // Commit version bump and lockfile changes.
-run("git add package.json package-lock.json")
+addVersionFiles()
 run('git commit -m "chore: bump patch version"')
 
 // Push to master.

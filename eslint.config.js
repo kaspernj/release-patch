@@ -2,7 +2,7 @@ import jsdoc from "eslint-plugin-jsdoc"
 
 export default [
   {
-    files: ["bin/**/*.js"],
+    files: ["bin/**/*.js", "tests/**/*.js"],
     plugins: { jsdoc },
     languageOptions: {
       ecmaVersion: "latest",
