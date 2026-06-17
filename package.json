@@ -1,6 +1,6 @@
 {
   "name": "release-patch",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Bump the patch version, sync master, commit, push and publish an npm package with a single command.",
   "type": "module",
   "bin": {
