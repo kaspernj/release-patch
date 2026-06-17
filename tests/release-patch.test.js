@@ -9,6 +9,7 @@ import {fileURLToPath} from "node:url"
 const testDirectory = dirname(fileURLToPath(import.meta.url))
 const projectRoot = resolve(testDirectory, "..")
 const releasePatchBin = join(projectRoot, "bin/release-patch.js")
+const projectPackageJson = JSON.parse(readFileSync(join(projectRoot, "package.json"), "utf8"))
 
 /**
  * Runs the CLI with fake npm and git commands and returns the command log.
@@ -95,6 +96,10 @@ function assertSingleExplicitBuildAfterVersion(commands) {
   assert.deepEqual(commands.filter((command) => command === "npm run build"), ["npm run build"])
   assert.ok(commands.indexOf("npm version patch --no-git-tag-version") < commands.indexOf("npm run build"))
 }
+
+test("defines a self-release script that runs the local CLI", () => {
+  assert.equal(projectPackageJson.scripts["release:patch"], "node bin/release-patch.js")
+})
 
 test("runs an explicit build when only publish lifecycle scripts build", () => {
   const commands = runReleasePatch(
