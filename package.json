@@ -17,6 +17,7 @@
     "fallow": "npm run fallow:audit",
     "fallow:audit": "fallow audit --gate new-only",
     "fallow:ci": "fallow audit --base origin/master --gate new-only --quiet",
+    "release:patch": "node bin/release-patch.js",
     "typecheck": "tsc --noEmit"
   },
   "keywords": [
