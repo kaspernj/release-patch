@@ -115,7 +115,6 @@ test("runs an explicit build when only publish lifecycle scripts build", () => {
 
   assert.deepEqual(commands.filter((command) => command === "npm run build"), ["npm run build"])
   assert.ok(commands.indexOf("npm run build") < commands.indexOf("git push origin master"))
-  assert.equal(commands.includes("npm install"), false)
 })
 
 test("does not run an explicit build when version lifecycle scripts build", () => {
@@ -132,6 +131,19 @@ test("does not run an explicit build when version lifecycle scripts build", () =
   assert.equal(commands.includes("npm run build"), false)
 })
 
+test("installs dependencies after syncing master and before versioning", () => {
+  const commands = runReleasePatch(
+    {
+      scripts: {}
+    },
+    {packageLock: true}
+  )
+
+  assert.deepEqual(commands.filter((command) => command === "npm install"), ["npm install"])
+  assert.ok(commands.indexOf("git merge origin/master") < commands.indexOf("npm install"))
+  assert.ok(commands.indexOf("npm install") < commands.indexOf("npm version patch --no-git-tag-version"))
+})
+
 test("runs one explicit build after bumping the version when no release lifecycle script builds", () => {
   const commands = runReleasePatch(
     {
@@ -143,7 +155,6 @@ test("runs one explicit build after bumping the version when no release lifecycl
   )
 
   assertSingleExplicitBuildAfterVersion(commands)
-  assert.equal(commands.includes("npm install"), false)
 })
 
 test("runs an explicit build when only preversion builds", () => {
@@ -163,6 +174,7 @@ test("runs an explicit build when only preversion builds", () => {
 test("does not require a package lock when none exists", () => {
   const commands = runReleasePatch({scripts: {}})
 
+  assert.ok(commands.includes("npm install --no-package-lock"))
   assert.equal(commands.includes("git add package.json package-lock.json"), false)
   assert.ok(commands.includes("git add package.json"))
 })
