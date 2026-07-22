@@ -10,7 +10,7 @@ When run from a package's root directory, it:
 
 1. Logs in to npm if you are not already authenticated (`npm login`).
 2. Syncs `master` with `origin/master` (`git checkout master`, `git fetch`, `git merge`).
-3. Installs dependencies (`npm install`, or `npm install --no-package-lock` when no `package-lock.json` exists).
+3. Installs dependencies (`npm install`, or `npm install --no-package-lock` when neither `package-lock.json` nor `npm-shrinkwrap.json` exists).
 4. Bumps the patch version without creating a git tag (`npm version patch --no-git-tag-version`).
 5. Runs `npm run build` **only if** the package defines a `build` script and its `version`/`postversion` lifecycle scripts do not already run `build`.
 6. Commits `package.json` and `package-lock.json` when present (`chore: bump patch version`).

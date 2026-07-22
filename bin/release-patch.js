@@ -39,7 +39,10 @@ function ensureLatestMaster() {
 
 /** Installs dependencies for the synced package before release lifecycle scripts can run. */
 function installDependencies() {
-  if (existsSync(resolve(process.cwd(), "package-lock.json"))) {
+  if (
+    existsSync(resolve(process.cwd(), "package-lock.json")) ||
+    existsSync(resolve(process.cwd(), "npm-shrinkwrap.json"))
+  ) {
     run("npm install")
   } else {
     run("npm install --no-package-lock")
