@@ -37,6 +37,18 @@ function ensureLatestMaster() {
   run("git merge origin/master")
 }
 
+/** Installs dependencies for the synced package before release lifecycle scripts can run. */
+function installDependencies() {
+  if (
+    existsSync(resolve(process.cwd(), "package-lock.json")) ||
+    existsSync(resolve(process.cwd(), "npm-shrinkwrap.json"))
+  ) {
+    run("npm install")
+  } else {
+    run("npm install --no-package-lock")
+  }
+}
+
 /**
  * Checks whether a package script invokes the package's build script.
  * @param {string | undefined} script The package script command to inspect.
@@ -68,6 +80,7 @@ function addVersionFiles() {
 
 ensureNpmAuth()
 ensureLatestMaster()
+installDependencies()
 
 const packageJson = readPackageJson()
 

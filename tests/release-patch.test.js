@@ -14,7 +14,7 @@ const projectPackageJson = JSON.parse(readFileSync(join(projectRoot, "package.js
 /**
  * Runs the CLI with fake npm and git commands and returns the command log.
  * @param {{scripts: Record<string, string>}} packageJson The package manifest to write.
- * @param {{packageLock?: boolean}} [options] Additional package fixture options.
+ * @param {{packageLock?: boolean, shrinkwrap?: boolean}} [options] Additional package fixture options.
  * @returns {string[]} The command lines invoked by the CLI.
  */
 function runReleasePatch(packageJson, options = {}) {
@@ -30,6 +30,9 @@ function runReleasePatch(packageJson, options = {}) {
     writeFileSync(join(packageRoot, "package.json"), JSON.stringify(packageJson, null, 2))
     if (options.packageLock) {
       writeFileSync(join(packageRoot, "package-lock.json"), "{}\n")
+    }
+    if (options.shrinkwrap) {
+      writeFileSync(join(packageRoot, "npm-shrinkwrap.json"), "{}\n")
     }
     writeExecutable(join(fakeBin, "npm"), fakeCommandScript("npm"))
     writeExecutable(join(fakeBin, "git"), fakeGitScript())
@@ -115,7 +118,6 @@ test("runs an explicit build when only publish lifecycle scripts build", () => {
 
   assert.deepEqual(commands.filter((command) => command === "npm run build"), ["npm run build"])
   assert.ok(commands.indexOf("npm run build") < commands.indexOf("git push origin master"))
-  assert.equal(commands.includes("npm install"), false)
 })
 
 test("does not run an explicit build when version lifecycle scripts build", () => {
@@ -132,6 +134,31 @@ test("does not run an explicit build when version lifecycle scripts build", () =
   assert.equal(commands.includes("npm run build"), false)
 })
 
+test("installs dependencies after syncing master and before versioning", () => {
+  const commands = runReleasePatch(
+    {
+      scripts: {}
+    },
+    {packageLock: true}
+  )
+
+  assert.deepEqual(commands.filter((command) => command === "npm install"), ["npm install"])
+  assert.ok(commands.indexOf("git merge origin/master") < commands.indexOf("npm install"))
+  assert.ok(commands.indexOf("npm install") < commands.indexOf("npm version patch --no-git-tag-version"))
+})
+
+test("runs normal install when npm shrinkwrap exists", () => {
+  const commands = runReleasePatch(
+    {
+      scripts: {}
+    },
+    {shrinkwrap: true}
+  )
+
+  assert.deepEqual(commands.filter((command) => command === "npm install"), ["npm install"])
+  assert.equal(commands.includes("npm install --no-package-lock"), false)
+})
+
 test("runs one explicit build after bumping the version when no release lifecycle script builds", () => {
   const commands = runReleasePatch(
     {
@@ -143,7 +170,6 @@ test("runs one explicit build after bumping the version when no release lifecycl
   )
 
   assertSingleExplicitBuildAfterVersion(commands)
-  assert.equal(commands.includes("npm install"), false)
 })
 
 test("runs an explicit build when only preversion builds", () => {
@@ -163,6 +189,7 @@ test("runs an explicit build when only preversion builds", () => {
 test("does not require a package lock when none exists", () => {
   const commands = runReleasePatch({scripts: {}})
 
+  assert.ok(commands.includes("npm install --no-package-lock"))
   assert.equal(commands.includes("git add package.json package-lock.json"), false)
   assert.ok(commands.includes("git add package.json"))
 })
