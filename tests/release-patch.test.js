@@ -685,12 +685,29 @@ test("does not require a package lock when none exists", () => {
   })
 })
 
-test("fetches tags from origin before calculating the next version", () => {
+test("fetches origin's authoritative tag set before calculating the next version", () => {
   withRelease({scripts: {}, packageLock: true, annotatedTags: ["v1.0.1"]}, (context) => {
     const commands = release(context)
+    const fetch = "git fetch origin --tags --prune --prune-tags --force"
 
-    assert.ok(commands.includes("git fetch origin --tags"))
-    assert.ok(commands.indexOf("git fetch origin --tags") < commands.indexOf(versionCommand(commands)))
+    assert.ok(commands.includes(fetch), "a normal release must sync tags authoritatively from origin")
+    assert.ok(commands.indexOf(fetch) < commands.indexOf(versionCommand(commands)))
+  })
+})
+
+test("a normal release treats origin as authoritative and ignores a stale local-only annotated tag", () => {
+  withRelease({scripts: {}, packageLock: true, annotatedTags: ["v1.0.0"]}, (context) => {
+    // A higher annotated tag that exists locally but was never pushed to origin must neither drive
+    // nor block the next-version derivation; only origin's tag set is authoritative.
+    git(context.work, ["tag", "-a", "v9.9.9", "-m", "v9.9.9"])
+
+    const commands = release(context)
+
+    assert.ok(commands.includes("npm version 1.0.1 --no-git-tag-version"), "must derive from origin's v1.0.0")
+    assert.equal(ranCommand(commands, "npm version 9.9."), false, "the local-only v9.9.9 must never drive derivation")
+    // The stale local-only tag is pruned during the sync so it can never poison a later derivation.
+    assert.equal(git(context.work, ["tag", "-l", "v9.9.9"]).trim(), "", "origin is authoritative: the local-only tag is removed")
+    assert.ok(registryOf(context).includes("fixture-package@1.0.1"))
   })
 })
 
@@ -747,7 +764,10 @@ test("pushes the release commit and exact tag atomically in a single non-force p
 
     assert.deepEqual(commands.filter((command) => command.startsWith("git push --atomic")), ["git push --atomic origin master v2.0.1"])
     assert.ok(commands.indexOf("git tag -a v2.0.1 -m v2.0.1") < commands.indexOf("git push --atomic origin master v2.0.1"))
-    assert.equal(commands.some((command) => /(?:^|\s)(?:--force|-f|--force-with-lease)(?:\s|$)/u.test(command)), false)
+    // No push may force: the authoritative tag *fetch* uses --force to mirror origin, but a push never does.
+    const pushes = commands.filter((command) => command.startsWith("git push"))
+
+    assert.equal(pushes.some((command) => /(?:^|\s)(?:--force|-f|--force-with-lease)(?:\s|$)/u.test(command)), false)
 
     // The bare origin now carries the exact annotated tag on the pushed commit.
     assert.equal(git(context.origin, ["cat-file", "-t", "v2.0.1"]).trim(), "tag")

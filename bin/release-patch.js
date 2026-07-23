@@ -158,9 +158,23 @@ function ensureLatestMaster() {
   run("git merge --ff-only origin/master")
 }
 
-/** Fetches tags from origin so tag-derived versions reflect the authoritative remote state. */
+/**
+ * Fetches tags from origin without disturbing local-only tags. A resume may publish a bootstrap tag
+ * that has been created locally but not yet pushed, so it must not prune tags that origin lacks.
+ */
 function fetchTags() {
   run("git fetch origin --tags")
+}
+
+/**
+ * Syncs tags so origin's tag set is authoritative before a normal release derives the next version.
+ * `--prune --prune-tags` deletes local tags that no longer exist on origin (stale or never-pushed
+ * local-only tags), and `--force` overwrites a local tag that origin has moved, so derivation can
+ * never be driven or blocked by a tag origin does not currently have. Annotated-vs-lightweight
+ * semantics are unaffected: force-updated tags keep their original object type.
+ */
+function fetchOriginAuthoritativeTags() {
+  run("git fetch origin --tags --prune --prune-tags --force")
 }
 
 /**
@@ -751,14 +765,16 @@ function main() {
 
   ensureNpmAuth()
 
-  // Git tags are the source of truth: fetch and read the latest annotated tag before touching metadata.
-  fetchTags()
-  const latest = latestAnnotatedReleaseTag()
-
+  // Git tags are the source of truth. A normal release derives the next version from origin's
+  // authoritative tag set, so it prunes local-only or stale tags and force-updates changed ones
+  // before reading the latest tag; resume may publish a not-yet-pushed bootstrap tag, so it fetches
+  // origin's tags without pruning the local ones.
   if (resume) {
-    runResume(packageJson, packageName, latest)
+    fetchTags()
+    runResume(packageJson, packageName, latestAnnotatedReleaseTag())
   } else {
-    runNormalRelease(packageJson, packageName, latest)
+    fetchOriginAuthoritativeTags()
+    runNormalRelease(packageJson, packageName, latestAnnotatedReleaseTag())
   }
 }
 
