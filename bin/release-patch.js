@@ -580,7 +580,22 @@ function pushPublishAndVerify(packageName, version, releaseTag) {
  * @param {string} version The exact version that should now be published.
  */
 function verifyPublished(packageName, version) {
-  runArgs("npm", ["view", `${packageName}@${version}`, "version"])
+  const spec = `${packageName}@${version}`
+
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    if (lookupPublishedVersion(spec).trim() !== "") return
+    waitForRegistryVisibility(spec, attempt)
+  }
+
+  throw new Error(`release-patch: ${spec} was published but did not become visible on npm after 5 attempts.`)
+}
+
+/** @param {string} spec The published package spec. @param {number} attempt The one-based visibility attempt. */
+function waitForRegistryVisibility(spec, attempt) {
+  if (attempt === 5) return
+
+  console.log(`release-patch: published ${spec}; waiting for npm registry visibility (attempt ${attempt}/5).`)
+  run(`sleep ${attempt}`)
 }
 
 /**
