@@ -580,7 +580,16 @@ function pushPublishAndVerify(packageName, version, releaseTag) {
  * @param {string} version The exact version that should now be published.
  */
 function verifyPublished(packageName, version) {
-  runArgs("npm", ["view", `${packageName}@${version}`, "version"])
+  const spec = `${packageName}@${version}`
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      runArgs("npm", ["view", spec, "version"])
+      return
+    } catch (error) {
+      if (!isRegistryNotFound(registryLookupOutput(error)) || attempt === 5) throw error
+      run(`sleep ${attempt}`)
+    }
+  }
 }
 
 /**
