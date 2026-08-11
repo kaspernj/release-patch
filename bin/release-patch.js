@@ -11,6 +11,12 @@ const releaseLifecycleScriptNames = ["version", "postversion"]
 // staged by name so a stray secret or build artifact can never be swept into the release with them.
 const versionManifestFiles = ["package.json", "package-lock.json", "npm-shrinkwrap.json"]
 
+// npm's read path can lag a successful publish. This bounded schedule checks for up to 150 seconds:
+// quickly at first, then at 30-second intervals so ordinary propagation does not look like failure.
+const registryVisibilityWaitSeconds = [1, 2, 4, 8, 15, 30, 30, 30, 30]
+const registryVisibilityAttempts = registryVisibilityWaitSeconds.length + 1
+const registryVisibilityWindowSeconds = registryVisibilityWaitSeconds.reduce((total, seconds) => total + seconds, 0)
+
 /** @param {string} command The shell command to run, inheriting stdio. */
 function run(command) {
   execSync(command, {stdio: "inherit"})
@@ -582,20 +588,32 @@ function pushPublishAndVerify(packageName, version, releaseTag) {
 function verifyPublished(packageName, version) {
   const spec = `${packageName}@${version}`
 
-  for (let attempt = 1; attempt <= 5; attempt++) {
+  for (let attempt = 1; attempt <= registryVisibilityAttempts; attempt++) {
     if (lookupPublishedVersion(spec).trim() !== "") return
-    waitForRegistryVisibility(spec, attempt)
+    waitForRegistryVisibility(spec, attempt, registryVisibilityWaitSeconds[attempt - 1])
   }
 
-  throw new Error(`release-patch: ${spec} was published but did not become visible on npm after 5 attempts.`)
+  throw new Error(
+    `release-patch: ${spec} was published but did not become visible on npm after ` +
+      `${registryVisibilityAttempts} attempts over ${registryVisibilityWindowSeconds} seconds. The release commit ` +
+      "and tag are already on origin; once registry availability is restored, run `release-patch --resume` to " +
+      "verify or finish this exact version without creating another release."
+  )
 }
 
-/** @param {string} spec The published package spec. @param {number} attempt The one-based visibility attempt. */
-function waitForRegistryVisibility(spec, attempt) {
-  if (attempt === 5) return
+/**
+ * @param {string} spec The published package spec.
+ * @param {number} attempt The one-based visibility attempt that just completed.
+ * @param {number | undefined} waitSeconds Seconds before the next attempt; absent after the final attempt.
+ */
+function waitForRegistryVisibility(spec, attempt, waitSeconds) {
+  if (waitSeconds === undefined) return
 
-  console.log(`release-patch: published ${spec}; waiting for npm registry visibility (attempt ${attempt}/5).`)
-  run(`sleep ${attempt}`)
+  console.log(
+    `release-patch: published ${spec}; waiting for npm registry visibility ` +
+      `(attempt ${attempt}/${registryVisibilityAttempts}); retrying in ${waitSeconds} seconds.`
+  )
+  run(`sleep ${waitSeconds}`)
 }
 
 /**
