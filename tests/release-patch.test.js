@@ -38,6 +38,7 @@ const versionManifestFiles = ["package.json", "package-lock.json", "npm-shrinkwr
  * @property {string} fakeBin The directory holding the fake npm and logging git shim.
  * @property {string} commandLog The path the fake commands append their invocations to.
  * @property {string} registryFile The JSON file backing the fake npm registry.
+ * @property {string} visibilityStateFile State used to simulate delayed registry propagation.
  * @property {string} realGit The absolute path to the real git binary.
  */
 
@@ -159,6 +160,9 @@ if (command === "publish") {
   const registry = readRegistry()
   if (!registry.includes(spec)) registry.push(spec)
   writeRegistry(registry)
+  if (process.env.NPM_VISIBILITY_MISSES) {
+    writeFileSync(process.env.NPM_VISIBILITY_STATE_FILE, JSON.stringify({spec, misses: 0}))
+  }
   process.exit(0)
 }
 
@@ -168,6 +172,19 @@ if (command === "view") {
   if (errorVersion && spec.endsWith("@" + errorVersion)) {
     process.stderr.write((process.env.NPM_VIEW_ERROR_STDERR || "") + "\\n")
     process.exit(Number(process.env.NPM_VIEW_ERROR_EXIT || "1"))
+  }
+  if (process.env.NPM_VISIBILITY_MISSES && existsSync(process.env.NPM_VISIBILITY_STATE_FILE)) {
+    const visibility = JSON.parse(readFileSync(process.env.NPM_VISIBILITY_STATE_FILE, "utf8"))
+    if (visibility.spec === spec && visibility.misses < Number(process.env.NPM_VISIBILITY_MISSES)) {
+      visibility.misses += 1
+      writeFileSync(process.env.NPM_VISIBILITY_STATE_FILE, JSON.stringify(visibility))
+      process.stderr.write("npm error code E404\\nnpm error 404 registry propagation pending\\n")
+      process.exit(1)
+    }
+    if (process.env.NPM_VISIBILITY_ERROR_AFTER_MISSES) {
+      process.stderr.write("npm error code EAI_AGAIN\\nnpm error network registry lookup failed\\n")
+      process.exit(1)
+    }
   }
   const registry = readRegistry()
   if (registry.includes(spec)) {
@@ -200,6 +217,18 @@ try {
 } catch (error) {
   process.exit(typeof error.status === "number" ? error.status : 1)
 }
+`
+}
+
+/**
+ * Builds a fake sleep command so visibility retry tests complete without wall-clock delays.
+ * @returns {string} The executable script contents.
+ */
+function fakeSleepScript() {
+  return `#!/usr/bin/env node
+import {appendFileSync} from "node:fs"
+
+appendFileSync(process.env.COMMAND_LOG, "sleep " + process.argv.slice(2).join(" ") + "\\n")
 `
 }
 
@@ -293,7 +322,8 @@ function createWorkspace() {
     origin: join(workspace, "origin.git"),
     fakeBin: join(workspace, "bin"),
     commandLog: join(workspace, "commands.log"),
-    registryFile: join(workspace, "registry.json")
+    registryFile: join(workspace, "registry.json"),
+    visibilityStateFile: join(workspace, "visibility.json")
   }
 
   mkdirSync(paths.work)
@@ -309,6 +339,7 @@ function createWorkspace() {
 function writeFakeBins(fakeBin) {
   writeExecutable(join(fakeBin, "npm"), fakeNpmScript())
   writeExecutable(join(fakeBin, "git"), fakeGitScript())
+  writeExecutable(join(fakeBin, "sleep"), fakeSleepScript())
 }
 
 /**
@@ -451,6 +482,7 @@ function runCli(context, runOptions = {}) {
     PATH: `${context.fakeBin}:${process.env.PATH}`,
     COMMAND_LOG: context.commandLog,
     REGISTRY_FILE: context.registryFile,
+    NPM_VISIBILITY_STATE_FILE: context.visibilityStateFile,
     REAL_GIT: context.realGit,
     ...runOptions.env
   }
@@ -784,6 +816,49 @@ test("publishes and then verifies the exact published version from the registry"
     assert.ok(publishIndex >= 0 && verifyIndex >= 0, "expected a publish and an exact registry lookup")
     assert.ok(publishIndex < verifyIndex, "verification must run after publishing")
     assert.ok(registryOf(context).includes("my-pkg@2.0.1"))
+  })
+})
+
+test("keeps checking with progress after the old ten-second registry visibility window", () => {
+  withRelease({name: "my-pkg", scripts: {}, packageLock: true, annotatedTags: ["v2.0.0"], published: ["my-pkg@2.0.0"]}, (context) => {
+    const result = runCli(context, {env: {NPM_VISIBILITY_MISSES: "6"}})
+
+    assert.equal(result.failure, undefined, `expected delayed visibility to succeed:\n${result.output}`)
+    const commands = commandsOf(context)
+    assert.equal(commands.filter((command) => command === "npm view my-pkg@2.0.1 version").length, 8)
+    assert.deepEqual(commands.filter((command) => command.startsWith("sleep ")).slice(0, 6), [
+      "sleep 1", "sleep 2", "sleep 4", "sleep 8", "sleep 15", "sleep 30"
+    ])
+    assert.match(result.stdout, /waiting for npm registry visibility .*attempt 6\/10.*30 seconds/u)
+  })
+})
+
+test("bounds registry visibility retries and points genuinely unavailable releases to resume", () => {
+  withRelease({name: "my-pkg", scripts: {}, packageLock: true, annotatedTags: ["v2.0.0"], published: ["my-pkg@2.0.0"]}, (context) => {
+    const {failure, output} = runCli(context, {env: {NPM_VISIBILITY_MISSES: "20"}})
+    const commands = commandsOf(context)
+
+    assert.ok(failure, "expected visibility verification to stop at its bounded limit")
+    assert.equal(commands.filter((command) => command === "npm view my-pkg@2.0.1 version").length, 11)
+    assert.deepEqual(commands.filter((command) => command.startsWith("sleep ")), [
+      "sleep 1", "sleep 2", "sleep 4", "sleep 8", "sleep 15", "sleep 30", "sleep 30", "sleep 30", "sleep 30"
+    ])
+    assert.match(output, /did not become visible on npm after 10 attempts over 150 seconds/u)
+    assert.match(output, /release-patch --resume/u)
+  })
+})
+
+test("fails closed when a visibility retry changes from not-found to an ambiguous registry error", () => {
+  withRelease({name: "my-pkg", scripts: {}, packageLock: true, annotatedTags: ["v2.0.0"], published: ["my-pkg@2.0.0"]}, (context) => {
+    const {failure, output} = runCli(context, {
+      env: {NPM_VISIBILITY_MISSES: "1", NPM_VISIBILITY_ERROR_AFTER_MISSES: "1"}
+    })
+    const commands = commandsOf(context)
+
+    assert.ok(failure, "an ambiguous registry failure must stop verification")
+    assert.match(output, /could not determine whether my-pkg@2\.0\.1 is already published/u)
+    assert.deepEqual(commands.filter((command) => command.startsWith("sleep ")), ["sleep 1"])
+    assert.equal(commands.filter((command) => command === "npm view my-pkg@2.0.1 version").length, 3)
   })
 })
 
