@@ -168,6 +168,10 @@ if (command === "publish") {
 
 if (command === "view") {
   const spec = args[1]
+  if (args.slice(2).join(" ") === "version gitHead --json" && process.env.NPM_METADATA_VERSION) {
+    process.stdout.write(JSON.stringify({version: process.env.NPM_METADATA_VERSION, gitHead: process.env.NPM_METADATA_GIT_HEAD}) + "\\n")
+    process.exit(0)
+  }
   const errorVersion = process.env.NPM_VIEW_ERROR_VERSION
   if (errorVersion && spec.endsWith("@" + errorVersion)) {
     process.stderr.write((process.env.NPM_VIEW_ERROR_STDERR || "") + "\\n")
@@ -1026,6 +1030,123 @@ test("refuses to release when the working tree has uncommitted changes", () => {
 test("rejects unknown CLI arguments before doing anything", () => {
   withRelease({scripts: {}, packageLock: true, annotatedTags: ["v1.0.0"]}, (context) => {
     assertBlocked(context, /unknown argument "--bogus"/u, {args: ["--bogus"]})
+  })
+})
+
+/**
+ * Adds an untagged published baseline commit followed by newer development on master.
+ * @param {ScenarioContext} context The scenario context.
+ * @param {{name?: string, baselineName?: string, baselineVersion?: string, currentVersion?: string}} [options] Fixture values.
+ * @returns {string} The untagged baseline commit SHA.
+ */
+function addUntaggedPublishedBaseline(context, options) {
+  const fixture = Object.assign({name: "my-pkg", baselineName: "my-pkg", baselineVersion: "0.5.10", currentVersion: "0.6.0"}, options)
+  const name = fixture.name
+  const baselineVersion = fixture.baselineVersion
+
+  writeFileSync(join(context.work, "package.json"), JSON.stringify({name: fixture.baselineName, version: baselineVersion, scripts: {}}, null, 2) + "\n")
+  git(context.work, ["add", "package.json"])
+  git(context.work, ["commit", "-m", `release ${baselineVersion} without tag`])
+  const baselineHead = revParse(context.work, "HEAD")
+
+  writeFileSync(join(context.work, "package.json"), JSON.stringify({name, version: fixture.currentVersion, scripts: {}}, null, 2) + "\n")
+  git(context.work, ["add", "package.json"])
+  git(context.work, ["commit", "-m", "later development"])
+  git(context.work, ["push", "origin", "master"])
+  writeFileSync(context.registryFile, JSON.stringify([`${name}@0.5.9`, `${name}@${baselineVersion}`]))
+
+  return baselineHead
+}
+
+/**
+ * Runs the guarded reconciliation mode and asserts it fails without release mutations.
+ * @param {ScenarioContext} context The scenario context.
+ * @param {RegExp} pattern Expected diagnostic.
+ * @param {string} gitHead Registry gitHead fixture.
+ */
+function assertReconciliationBlocked(context, pattern, gitHead) {
+  assertBlocked(context, pattern, {
+    args: ["--reconcile-published", "0.5.10"],
+    env: {NPM_METADATA_VERSION: "0.5.10", NPM_METADATA_GIT_HEAD: gitHead}
+  })
+}
+
+test("reconciles an exact untagged published baseline and releases the following patch", () => {
+  withRelease({name: "my-pkg", version: "0.5.9", scripts: {}, packageLock: true, annotatedTags: ["v0.5.9"]}, (context) => {
+    const baselineHead = addUntaggedPublishedBaseline(context)
+    const commands = release(context, {
+      args: ["--reconcile-published", "0.5.10"],
+      env: {NPM_METADATA_VERSION: "0.5.10", NPM_METADATA_GIT_HEAD: baselineHead}
+    })
+
+    assert.equal(git(context.origin, ["cat-file", "-t", "v0.5.10"]).trim(), "tag")
+    assert.equal(revParse(context.origin, "v0.5.10^{commit}"), baselineHead)
+    assert.ok(registryOf(context).includes("my-pkg@0.5.11"))
+    assert.ok(commands.includes("npm view my-pkg@0.5.10 version gitHead --json"))
+    assert.ok(commands.includes(`git tag -a v0.5.10 ${baselineHead} -m v0.5.10`))
+    assert.ok(commands.includes("git push origin v0.5.10"))
+    assert.ok(commands.indexOf("git push origin v0.5.10") < commands.indexOf("npm version 0.5.11 --no-git-tag-version"))
+  })
+})
+
+test("reconciliation fails closed before tagging when registry provenance is incomplete", () => {
+  withRelease({name: "my-pkg", version: "0.5.9", scripts: {}, packageLock: true, annotatedTags: ["v0.5.9"]}, (context) => {
+    addUntaggedPublishedBaseline(context)
+    assertReconciliationBlocked(context, /registry metadata.*gitHead/u, "")
+  })
+})
+
+test("reconciliation rejects a gitHead outside origin master history", () => {
+  withRelease({name: "my-pkg", version: "0.5.9", scripts: {}, packageLock: true, annotatedTags: ["v0.5.9"]}, (context) => {
+    addUntaggedPublishedBaseline(context)
+    git(context.work, ["checkout", "--orphan", "foreign"])
+    git(context.work, ["commit", "--allow-empty", "-m", "foreign history"])
+    const foreignHead = revParse(context.work, "HEAD")
+    git(context.work, ["checkout", "master"])
+
+    assertReconciliationBlocked(context, /not an ancestor of origin\/master/u, foreignHead)
+  })
+})
+
+test("reconciliation rejects a registry gitHead that does not exist locally after fetch", () => {
+  withRelease({name: "my-pkg", version: "0.5.9", scripts: {}, packageLock: true, annotatedTags: ["v0.5.9"]}, (context) => {
+    addUntaggedPublishedBaseline(context)
+    assertReconciliationBlocked(context, /gitHead f{40}.*missing from this repository/u, "f".repeat(40))
+  })
+})
+
+test("reconciliation rejects package identity or version mismatches at registry gitHead", () => {
+  withRelease({name: "my-pkg", version: "0.5.9", scripts: {}, packageLock: true, annotatedTags: ["v0.5.9"]}, (context) => {
+    const wrongPackageHead = addUntaggedPublishedBaseline(context, {baselineName: "other-pkg"})
+    assertReconciliationBlocked(context, /package\.json at .* declares name other-pkg/u, wrongPackageHead)
+  })
+})
+
+test("reconciliation rejects a version mismatch at registry gitHead", () => {
+  withRelease({name: "my-pkg", version: "0.5.9", scripts: {}, packageLock: true, annotatedTags: ["v0.5.9"]}, (context) => {
+    const wrongVersionHead = addUntaggedPublishedBaseline(context, {baselineVersion: "0.5.8"})
+    assertReconciliationBlocked(context, /declares version 0\.5\.8, not registry version 0\.5\.10/u, wrongVersionHead)
+  })
+})
+
+test("reconciliation refuses an existing tag instead of moving or replacing it", () => {
+  withRelease({name: "my-pkg", version: "0.5.9", scripts: {}, packageLock: true, annotatedTags: ["v0.5.9"]}, (context) => {
+    const baselineHead = addUntaggedPublishedBaseline(context)
+    git(context.work, ["tag", "-a", "v0.5.10", "v0.5.9^{commit}", "-m", "wrong target"])
+    git(context.work, ["push", "origin", "v0.5.10"])
+
+    assertReconciliationBlocked(context, /tag v0\.5\.10 already exists/u, baselineHead)
+    assert.equal(revParse(context.origin, "v0.5.10^{commit}"), revParse(context.origin, "v0.5.9^{commit}"))
+  })
+})
+
+test("reconciliation preserves duplicate protection before creating the baseline tag", () => {
+  withRelease({name: "my-pkg", version: "0.5.9", scripts: {}, packageLock: true, annotatedTags: ["v0.5.9"]}, (context) => {
+    const baselineHead = addUntaggedPublishedBaseline(context)
+    writeFileSync(context.registryFile, JSON.stringify(["my-pkg@0.5.9", "my-pkg@0.5.10", "my-pkg@0.5.11"]))
+
+    assertReconciliationBlocked(context, /my-pkg@0\.5\.11 is already published/u, baselineHead)
+    assert.equal(git(context.work, ["tag", "-l", "v0.5.10"]).trim(), "")
   })
 })
 

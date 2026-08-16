@@ -33,6 +33,16 @@ function runArgs(file, args) {
 }
 
 /**
+ * Runs a command with explicit arguments and captures stdout.
+ * @param {string} file The executable to run.
+ * @param {string[]} args The arguments passed verbatim to the executable.
+ * @returns {string} The command's stdout.
+ */
+function runCaptureArgs(file, args) {
+  return execFileSync(file, args, {encoding: "utf8", stdio: ["ignore", "pipe", "inherit"]})
+}
+
+/**
  * Runs a command and captures its stdout so it can drive release decisions.
  * @param {string} command The shell command to run.
  * @returns {string} The command's stdout.
@@ -50,23 +60,43 @@ const releaseTagPattern = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u
  * Parses the CLI invocation, accepting only the documented flags and rejecting anything else so a
  * typo can never be silently ignored and run a destructive default.
  * @param {string[]} argv The full `process.argv`.
- * @returns {{resume: boolean}} The parsed release mode.
+ * @returns {{resume: boolean, reconcilePublished?: string}} The parsed release mode.
  */
 function parseCliArgs(argv) {
-  let resume = false
+  const args = argv.slice(2)
 
-  for (const arg of argv.slice(2)) {
-    if (arg === "--resume") {
-      resume = true
-    } else {
-      throw new Error(
-        `release-patch: unknown argument ${JSON.stringify(arg)}. The only supported flag is --resume ` +
-        "(publish an already-tagged-but-unpublished release); run without flags for a normal patch release."
-      )
-    }
+  if (args.length === 0) return {resume: false}
+  if (args[0] === "--resume") return parseResumeArgs(args)
+  if (args[0] === "--reconcile-published") {
+    return parseReconcileArgs(args)
   }
 
-  return {resume}
+  throw new Error(
+    `release-patch: unknown argument ${JSON.stringify(args[0])}. Supported modes are --resume and ` +
+    "--reconcile-published X.Y.Z; run without flags for a normal patch release."
+  )
+}
+
+/**
+ * @param {string[]} args CLI arguments beginning with --resume.
+ * @returns {{resume: boolean}} Resume mode.
+ */
+function parseResumeArgs(args) {
+  if (args.length === 1) return {resume: true}
+  throw new Error("release-patch: --resume cannot be combined with another release mode or argument.")
+}
+
+/**
+ * @param {string[]} args CLI arguments beginning with --reconcile-published.
+ * @returns {{resume: boolean, reconcilePublished: string}} Reconcile mode.
+ */
+function parseReconcileArgs(args) {
+  if (args.length === 2 && parseReleaseTag(`v${args[1]}`) !== null) {
+    return {resume: false, reconcilePublished: args[1]}
+  }
+  throw new Error(
+    `release-patch: --reconcile-published requires one exact stable X.Y.Z version argument, got ${JSON.stringify(args.slice(1))}.`
+  )
 }
 
 /**
@@ -617,6 +647,229 @@ function waitForRegistryVisibility(spec, attempt, waitSeconds) {
 }
 
 /**
+ * Reads the registry's immutable provenance fields for an exact published package version.
+ * @param {string} packageName The validated package name.
+ * @param {string} version The explicitly requested published baseline.
+ * @returns {{version: string, gitHead: string}} Authenticated registry metadata.
+ */
+function publishedProvenance(packageName, version) {
+  const spec = `${packageName}@${version}`
+  let metadata
+
+  try {
+    metadata = JSON.parse(runCaptureArgs("npm", ["view", spec, "version", "gitHead", "--json"]))
+  } catch (error) {
+    throw new Error(
+      `release-patch: could not authenticate registry metadata for ${spec}; refusing to reconcile an uncertain baseline.`,
+      {cause: error}
+    )
+  }
+
+  ensureExactPublishedProvenance(metadata, version, spec)
+
+  return /** @type {{version: string, gitHead: string}} */ (metadata)
+}
+
+/**
+ * @param {unknown} metadata Parsed npm metadata.
+ * @param {string} version The exact requested version.
+ * @param {string} spec Exact package spec for diagnostics.
+ */
+function ensureExactPublishedProvenance(metadata, version, spec) {
+  const candidate = /** @type {{version?: unknown, gitHead?: unknown}} */ (Object(metadata))
+  if (candidate.version !== version) throwInvalidPublishedProvenance(spec, version)
+  if (typeof candidate.gitHead !== "string") throwInvalidPublishedProvenance(spec, version)
+  if (!/^[0-9a-f]{40}$/u.test(candidate.gitHead)) throwInvalidPublishedProvenance(spec, version)
+}
+
+/**
+ * @param {string} spec Package spec.
+ * @param {string} version Expected version.
+ * @returns {never} Always throws.
+ */
+function throwInvalidPublishedProvenance(spec, version) {
+  throw new Error(
+    `release-patch: registry metadata for ${spec} must unambiguously contain version ${version} and one full ` +
+    "40-character lowercase hexadecimal gitHead; refusing to guess or tag."
+  )
+}
+
+/**
+ * Reports whether a Git command exits successfully without exposing expected failure output.
+ * @param {string[]} args Git arguments.
+ * @returns {boolean} Whether Git exited successfully.
+ */
+function gitSucceeds(args) {
+  try {
+    execFileSync("git", args, {stdio: "ignore"})
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Proves the registry commit exists on authoritative master history and carries the exact package.
+ * @param {string} gitHead The registry commit SHA.
+ * @param {string} packageName The expected package identity.
+ * @param {string} version The expected package version.
+ */
+function ensureRegistryCommitIdentity(gitHead, packageName, version) {
+  ensureRegistryCommitExists(gitHead, packageName, version)
+  ensureRegistryCommitReachable(gitHead, packageName, version)
+  ensureHistoricalManifestIdentity(packageJsonAtCommit(gitHead), gitHead, packageName, version)
+}
+
+/**
+ * @param {string} gitHead Commit SHA.
+ * @param {string} packageName Package name.
+ * @param {string} version Version.
+ */
+function ensureRegistryCommitExists(gitHead, packageName, version) {
+  if (!gitSucceeds(["cat-file", "-e", `${gitHead}^{commit}`])) {
+    throw new Error(`release-patch: registry gitHead ${gitHead} for ${packageName}@${version} is missing from this repository after fetching origin.`)
+  }
+}
+
+/**
+ * @param {string} gitHead Commit SHA.
+ * @param {string} packageName Package name.
+ * @param {string} version Version.
+ */
+function ensureRegistryCommitReachable(gitHead, packageName, version) {
+  if (!gitSucceeds(["merge-base", "--is-ancestor", gitHead, "origin/master"])) {
+    throw new Error(
+      `release-patch: registry gitHead ${gitHead} for ${packageName}@${version} is not an ancestor of origin/master; ` +
+      "it does not belong to the authoritative release history, so no tag was created."
+    )
+  }
+}
+
+/**
+ * @param {{name?: string, version?: string}} historicalManifest Historical manifest.
+ * @param {string} gitHead Commit SHA.
+ * @param {string} packageName Expected package name.
+ * @param {string} version Expected version.
+ */
+function ensureHistoricalManifestIdentity(historicalManifest, gitHead, packageName, version) {
+  ensureHistoricalName(historicalManifest, gitHead, packageName)
+  ensureHistoricalVersion(historicalManifest, gitHead, version)
+}
+
+/**
+ * @param {{name?: string}} manifest Manifest.
+ * @param {string} gitHead SHA.
+ * @param {string} packageName Name.
+ */
+function ensureHistoricalName(manifest, gitHead, packageName) {
+  if (manifest.name !== packageName) {
+    throw new Error(
+      `release-patch: package.json at registry gitHead ${gitHead} declares name ${manifest.name ?? "unset"}, ` +
+      `not the current package identity ${packageName}; no tag was created.`
+    )
+  }
+}
+
+/**
+ * @param {{version?: string}} manifest Manifest.
+ * @param {string} gitHead SHA.
+ * @param {string} version Version.
+ */
+function ensureHistoricalVersion(manifest, gitHead, version) {
+  if (manifest.version !== version) {
+    throw new Error(
+      `release-patch: package.json at registry gitHead ${gitHead} declares version ${manifest.version ?? "unset"}, ` +
+      `not registry version ${version}; no tag was created.`
+    )
+  }
+}
+
+/**
+ * @param {string} gitHead The exact commit to inspect.
+ * @returns {{name?: string, version?: string}} Its parsed package manifest.
+ */
+function packageJsonAtCommit(gitHead) {
+  try {
+    return JSON.parse(runCaptureArgs("git", ["show", `${gitHead}:package.json`]))
+  } catch (error) {
+    throw new Error(`release-patch: could not read an unambiguous package.json at registry gitHead ${gitHead}; no tag was created.`, {cause: error})
+  }
+}
+
+/**
+ * Creates an absent baseline tag or verifies an exact prior-attempt tag without ever replacing it.
+ * @param {string} releaseTag The baseline tag.
+ * @param {string} gitHead The authenticated target commit.
+ */
+function createOrVerifyBaselineTag(releaseTag, gitHead) {
+  if (!gitSucceeds(["show-ref", "--verify", "--quiet", `refs/tags/${releaseTag}`])) {
+    runArgs("git", ["tag", "-a", releaseTag, gitHead, "-m", releaseTag])
+    return
+  }
+
+  const type = runCaptureArgs("git", ["cat-file", "-t", releaseTag]).trim()
+  const target = runCaptureArgs("git", ["rev-parse", `${releaseTag}^{commit}`]).trim()
+  if (type !== "tag" || target !== gitHead) {
+    throw new Error(
+      `release-patch: tag ${releaseTag} already exists but is not the expected annotated tag on registry gitHead ` +
+      `${gitHead}; refusing to move, replace or force-push it.`
+    )
+  }
+}
+
+/**
+ * Reconciles one explicitly named npm-published baseline that is missing its release tag, then uses
+ * the unchanged normal release path to cut the following patch from that authenticated baseline.
+ * @param {{name: string, version?: string, scripts?: Record<string, string>}} packageJson The current validated manifest.
+ * @param {string} packageName The current validated package name.
+ * @param {string} version The exact already-published baseline version.
+ * @param {{tag: string, version: {major: number, minor: number, patch: number}} | null} latest The latest release tag.
+ */
+function runReconciledRelease(packageJson, packageName, version, latest) {
+  const requestedVersion = /** @type {{major: number, minor: number, patch: number}} */ (parseReleaseTag(`v${version}`))
+  ensureReconciliationFollowsLatest(latest, requestedVersion, version)
+
+  const {gitHead} = publishedProvenance(packageName, version)
+  ensureRegistryCommitIdentity(gitHead, packageName, version)
+
+  // Prove the following patch is available before recording even the baseline tag. The unchanged
+  // normal release repeats this duplicate preflight immediately before its own mutations.
+  ensureVersionAvailable(packageName, deriveNextPatchVersion(requestedVersion))
+
+  const releaseTag = `v${version}`
+  createOrVerifyBaselineTag(releaseTag, gitHead)
+
+  // Publish the authenticated immutable baseline tag by itself. If this non-force push fails, the
+  // local exact tag remains for inspection and an idempotent retry; no version commit exists yet.
+  runArgs("git", ["push", "origin", releaseTag])
+  runNormalRelease(packageJson, packageName, {tag: releaseTag, version: /** @type {{major: number, minor: number, patch: number}} */ (parseReleaseTag(releaseTag))})
+}
+
+/**
+ * @param {{tag: string, version: {major: number, minor: number, patch: number}} | null} latest Latest tag.
+ * @param {{major: number, minor: number, patch: number}} requestedVersion Requested parsed version.
+ * @param {string} version Requested string version.
+ */
+function ensureReconciliationFollowsLatest(latest, requestedVersion, version) {
+  if (latest === null) throwInvalidReconciliationSequence(version, "none")
+  if (compareVersions(latest.version, requestedVersion) === 0) return
+  if (deriveNextPatchVersion(latest.version) === version) return
+  throwInvalidReconciliationSequence(version, latest.tag)
+}
+
+/**
+ * @param {string} version Requested version.
+ * @param {string} latestTag Latest tag.
+ * @returns {never} Always throws.
+ */
+function throwInvalidReconciliationSequence(version, latestTag) {
+  throw new Error(
+    `release-patch: --reconcile-published ${version} must be exactly one patch after the latest annotated release ` +
+    `tag (${latestTag}); refusing to fill an ambiguous gap or rewrite release history.`
+  )
+}
+
+/**
  * Runs a normal patch release derived from tags. The latest annotated tag must already be on npm — a
  * tagged-but-unpublished latest tag blocks with instructions to use `--resume` rather than being
  * silently skipped. When the latest tag is published, the next patch is derived and preflighted, then
@@ -782,7 +1035,7 @@ function ensureResumeMatchesTaggedCommit(packageJson, releaseTag, version) {
 
 /** Runs the release, choosing a normal patch release or a resume based on the CLI arguments. */
 function main() {
-  const {resume} = parseCliArgs(process.argv)
+  const {resume, reconcilePublished} = parseCliArgs(process.argv)
 
   // Refuse to run against a dirty tree before touching any branch, so stray edits can never leak into
   // the release commit and `git checkout master` can never clobber uncommitted work.
@@ -807,7 +1060,13 @@ function main() {
     runResume(packageJson, packageName, latestAnnotatedReleaseTag())
   } else {
     fetchOriginAuthoritativeTags()
-    runNormalRelease(packageJson, packageName, latestAnnotatedReleaseTag())
+    const latest = latestAnnotatedReleaseTag()
+
+    if (reconcilePublished !== undefined) {
+      runReconciledRelease(packageJson, packageName, reconcilePublished, latest)
+    } else {
+      runNormalRelease(packageJson, packageName, latest)
+    }
   }
 }
 
