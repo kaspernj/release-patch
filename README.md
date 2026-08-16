@@ -49,13 +49,17 @@ release-patch --resume
 Use this guarded package-owned mode only when npm already contains the patch immediately after the latest annotated release tag, but that published patch has no tag:
 
 ```sh
-release-patch --reconcile-published 0.5.10
+release-patch --reconcile-published 0.5.10 --expected-git-head 161a8291ffd9c66f5bdb4cd13f18e97d37e0648e
 ```
 
-The version argument is mandatory and must be exact `X.Y.Z`. The command reads `version` and `gitHead` together from npm for that exact package version, then fails closed unless all of the following are true:
+Both arguments are mandatory: the version must be exact `X.Y.Z`, and the expected Git commit must be its full 40-character lowercase SHA reviewed from the package's authoritative history. npm's `gitHead` is publisher-supplied metadata, not an independent proof of provenance. The operator-supplied SHA is therefore the trust anchor: the command reads `version` and `gitHead` together from npm for that exact package version and requires the registry value to match the expected SHA byte-for-byte before trusting it.
+
+The command then fails closed unless all of the following are true:
 
 - the requested version is exactly one patch after the latest annotated tag (or is the exact tag from a partially completed reconciliation);
+- the preceding annotated tag is already published on npm, preserving the normal release invariant;
 - npm returns that exact version and one full 40-character lowercase hexadecimal `gitHead`;
+- npm's `gitHead` exactly matches the operator-supplied `--expected-git-head`;
 - the commit exists after syncing `master` and fetching origin, and is an ancestor of authoritative `origin/master`;
 - `package.json` at that commit has the same package name as current synced `master` and exactly the requested version;
 - the baseline tag is absent, or is already the same annotated tag on that exact commit after an interrupted attempt; and
@@ -63,7 +67,7 @@ The version argument is mandatory and must be exact `X.Y.Z`. The command reads `
 
 Only after every check succeeds does the command create and non-force-push the missing annotated baseline tag. It then runs the ordinary release transaction unchanged, deriving and publishing the following patch. It never checks out or changes the historical commit, never moves or replaces an existing tag, and never weakens normal duplicate detection or `--resume`.
 
-Recovery is rerunning the exact same helper invocation. If baseline tag creation fails, nothing was pushed and no release commit was made. If its push fails, an exact local tag may remain; the retry re-fetches authoritative tags and recreates or accepts only the verified exact tag. If the baseline tag is pushed but the following normal release fails before its atomic release push, rerun the same reconciliation invocation. If that normal release's atomic push succeeded but npm publishing failed, follow its printed `release-patch --resume` instruction, exactly as for any ordinary release.
+Recovery is rerunning the exact same helper invocation. If baseline tag creation fails, nothing was pushed and no release commit was made. If its push fails, an exact local tag may remain; the retry re-fetches authoritative tags and recreates or accepts only the verified exact tag. After the baseline tag is pushed, any failure during dependency installation, versioning, build, dry-run, commit, or release-tag creation automatically restores the clean pre-release `master`, removes the unpushed release tag and non-ignored files created by the attempt, and reports that the same invocation is safe to retry. Lifecycle scripts may still have external side effects that Git cannot undo. An atomic-push error has an ambiguous remote outcome, so the exact clean release commit/tag are preserved and recovery uses the printed `release-patch --resume` instruction instead of bumping again. Publishing or verification failures after a successful push use that same resume path.
 
 ## Bootstrapping a brand-new package
 

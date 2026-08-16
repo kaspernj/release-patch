@@ -60,7 +60,7 @@ const releaseTagPattern = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u
  * Parses the CLI invocation, accepting only the documented flags and rejecting anything else so a
  * typo can never be silently ignored and run a destructive default.
  * @param {string[]} argv The full `process.argv`.
- * @returns {{resume: boolean, reconcilePublished?: string}} The parsed release mode.
+ * @returns {{resume: boolean, reconcilePublished?: string, expectedGitHead?: string}} The parsed release mode.
  */
 function parseCliArgs(argv) {
   const args = argv.slice(2)
@@ -73,7 +73,7 @@ function parseCliArgs(argv) {
 
   throw new Error(
     `release-patch: unknown argument ${JSON.stringify(args[0])}. Supported modes are --resume and ` +
-    "--reconcile-published X.Y.Z; run without flags for a normal patch release."
+    "--reconcile-published X.Y.Z --expected-git-head <SHA>; run without flags for a normal patch release."
   )
 }
 
@@ -88,14 +88,32 @@ function parseResumeArgs(args) {
 
 /**
  * @param {string[]} args CLI arguments beginning with --reconcile-published.
- * @returns {{resume: boolean, reconcilePublished: string}} Reconcile mode.
+ * @returns {{resume: boolean, reconcilePublished: string, expectedGitHead: string}} Reconcile mode.
  */
 function parseReconcileArgs(args) {
-  if (args.length === 2 && parseReleaseTag(`v${args[1]}`) !== null) {
-    return {resume: false, reconcilePublished: args[1]}
-  }
+  if (args.length !== 4) throwInvalidReconcileArgs()
+  if (parseReleaseTag(`v${args[1]}`) === null) throwInvalidReconcileArgs()
+
+  return {resume: false, reconcilePublished: args[1], expectedGitHead: parseExpectedGitHead(args[2], args[3])}
+}
+
+/**
+ * @param {string} flag Expected flag.
+ * @param {string} sha Expected SHA.
+ * @returns {string} Validated SHA.
+ */
+function parseExpectedGitHead(flag, sha) {
+  if (flag !== "--expected-git-head") throwInvalidReconcileArgs()
+  if (!/^[0-9a-f]{40}$/u.test(sha)) throwInvalidReconcileArgs()
+  return sha
+}
+
+/**
+ * @returns {never} Always throws.
+ */
+function throwInvalidReconcileArgs() {
   throw new Error(
-    `release-patch: --reconcile-published requires one exact stable X.Y.Z version argument, got ${JSON.stringify(args.slice(1))}.`
+    "release-patch: reconciliation requires `--reconcile-published X.Y.Z --expected-git-head <40-character lowercase SHA>`."
   )
 }
 
@@ -515,53 +533,6 @@ function commitVersionFiles(existingVersionManifests) {
 }
 
 /**
- * Creates the annotated release tag on the just-made release commit. If tag creation fails (for
- * example a broken signing configuration), the newly-created local release commit is rolled back to
- * the captured pre-release HEAD so no stranded, untagged, unpushed commit is left on master. The
- * rollback is safe because the pre-release tree was clean and only validated manifests were committed.
- * @param {string} releaseTag The annotated release tag to create (`v<version>`).
- * @param {string} preReleaseHead The clean HEAD recorded before the release commit was made.
- */
-function createReleaseTagOrRollback(releaseTag, preReleaseHead) {
-  try {
-    run(`git tag -a ${releaseTag} -m ${releaseTag}`)
-  } catch (tagError) {
-    rollbackReleaseCommit(releaseTag, preReleaseHead, tagError)
-  }
-}
-
-/**
- * Rolls the newly-created release commit back to the captured pre-release HEAD after a failed tag
- * creation, preserving the non-zero exit and reporting truthfully whether the rollback succeeded.
- * @param {string} releaseTag The tag whose creation failed.
- * @param {string} preReleaseHead The clean HEAD to reset master back to.
- * @param {unknown} tagError The tag-creation failure to preserve as the cause.
- * @returns {never} Always throws to abort the release.
- */
-function rollbackReleaseCommit(releaseTag, preReleaseHead, tagError) {
-  try {
-    run(`git reset --hard ${preReleaseHead}`)
-  } catch (resetError) {
-    throw new Error(
-      `release-patch: creating the annotated tag ${releaseTag} failed AND the automatic rollback of the release ` +
-      "commit failed. Your local master still has an extra, untagged, unpushed release commit. Nothing was pushed " +
-      `or published, but this release's lifecycle scripts may have had external side effects. To recover manually, ` +
-      `run \`git reset --hard ${preReleaseHead}\` on master (its tree was clean and only version manifests were ` +
-      "committed), then fix the tag failure and re-run the release.",
-      {cause: resetError}
-    )
-  }
-
-  throw new Error(
-    `release-patch: creating the annotated tag ${releaseTag} failed, so the release was aborted. The newly-created ` +
-    `release commit was rolled back to ${preReleaseHead}; master, its tags and origin are unchanged and the working ` +
-    "tree is clean. Nothing was pushed or published, but this release's lifecycle scripts may have had external side " +
-    "effects. Fix the cause (for example a broken git tag signing configuration) and re-run the release.",
-    {cause: tagError}
-  )
-}
-
-/**
  * After the intended version commit, refuses to tag or push if any tracked or untracked non-ignored
  * change remains in the working tree. A publish dry-run or build lifecycle script can emit generated
  * files or secrets; tagging and pushing with them present would ship an inconsistent release, so this
@@ -595,6 +566,16 @@ function pushPublishAndVerify(packageName, version, releaseTag) {
   // never published without the matching release tag if the tag push would fail on its own.
   run(`git push --atomic origin master ${releaseTag}`)
 
+  publishAndVerify(packageName, version, releaseTag)
+}
+
+/**
+ * Publishes after the release refs are public, preserving resume recovery on any registry failure.
+ * @param {string} packageName The validated package name.
+ * @param {string} version The exact version being released.
+ * @param {string} releaseTag The already-pushed annotated release tag.
+ */
+function publishAndVerify(packageName, version, releaseTag) {
   try {
     run("npm publish")
   } catch (error) {
@@ -823,13 +804,16 @@ function createOrVerifyBaselineTag(releaseTag, gitHead) {
  * @param {{name: string, version?: string, scripts?: Record<string, string>}} packageJson The current validated manifest.
  * @param {string} packageName The current validated package name.
  * @param {string} version The exact already-published baseline version.
+ * @param {string} expectedGitHead The operator-reviewed baseline commit SHA.
  * @param {{tag: string, version: {major: number, minor: number, patch: number}} | null} latest The latest release tag.
  */
-function runReconciledRelease(packageJson, packageName, version, latest) {
+function runReconciledRelease(packageJson, packageName, version, expectedGitHead, latest) {
   const requestedVersion = /** @type {{major: number, minor: number, patch: number}} */ (parseReleaseTag(`v${version}`))
   ensureReconciliationFollowsLatest(latest, requestedVersion, version)
+  ensurePrecedingTagPublished(packageName, requestedVersion)
 
   const {gitHead} = publishedProvenance(packageName, version)
+  ensureExpectedGitHead(gitHead, expectedGitHead, packageName, version)
   ensureRegistryCommitIdentity(gitHead, packageName, version)
 
   // Prove the following patch is available before recording even the baseline tag. The unchanged
@@ -843,6 +827,39 @@ function runReconciledRelease(packageJson, packageName, version, latest) {
   // local exact tag remains for inspection and an idempotent retry; no version commit exists yet.
   runArgs("git", ["push", "origin", releaseTag])
   runNormalRelease(packageJson, packageName, {tag: releaseTag, version: /** @type {{major: number, minor: number, patch: number}} */ (parseReleaseTag(releaseTag))})
+}
+
+/**
+ * Preserves the normal release invariant that the preceding authoritative tag is already on npm.
+ * @param {string} packageName Package name.
+ * @param {{major: number, minor: number, patch: number}} requestedVersion Reconciliation version.
+ */
+function ensurePrecedingTagPublished(packageName, requestedVersion) {
+  const precedingVersion = `${requestedVersion.major}.${requestedVersion.minor}.${requestedVersion.patch - 1}`
+  const precedingTag = `v${precedingVersion}`
+  const annotatedPredecessorExists = annotatedReleaseTags().some(({tag}) => tag === precedingTag)
+
+  if (!annotatedPredecessorExists) throwInvalidReconciliationSequence(versionString(requestedVersion), precedingTag)
+  if (lookupPublishedVersion(`${packageName}@${precedingVersion}`).trim() !== "") return
+  throw new Error(
+    `release-patch: the preceding release tag ${precedingTag} is not published on npm; refusing to reconcile a later ` +
+    "baseline that would bypass normal release history."
+  )
+}
+
+/**
+ * Makes the operator-reviewed SHA, not publisher-supplied npm metadata, the provenance trust anchor.
+ * @param {string} registryGitHead Registry metadata SHA.
+ * @param {string} expectedGitHead Operator-supplied SHA.
+ * @param {string} packageName Package name.
+ * @param {string} version Package version.
+ */
+function ensureExpectedGitHead(registryGitHead, expectedGitHead, packageName, version) {
+  if (registryGitHead === expectedGitHead) return
+  throw new Error(
+    `release-patch: registry gitHead ${registryGitHead} for ${packageName}@${version} does not exactly match the ` +
+    `operator's expected baseline ${expectedGitHead}; refusing to trust publisher-supplied provenance or create a tag.`
+  )
 }
 
 /**
@@ -912,33 +929,91 @@ function runNormalRelease(packageJson, packageName, latest) {
   const existingVersionManifests = existingVersionManifestFiles()
   const preReleaseHead = runCapture("git rev-parse --verify HEAD").trim()
 
-  installDependencies()
+  prepareLocalRelease(packageJson, nextVersion, releaseTag, existingVersionManifests, preReleaseHead)
+  pushPreparedRelease(releaseTag)
 
-  // Set the exact derived version without creating a git tag; we tag the release commit ourselves below.
-  run(`npm version ${nextVersion} --no-git-tag-version`)
+  // Once the atomic push succeeds, recovery switches to --resume and local refs must be preserved.
+  publishAndVerify(packageName, nextVersion, releaseTag)
+}
 
-  // Build after the version bump unless npm lifecycle scripts already do it.
-  runExplicitBuildIfNeeded(packageJson)
+/**
+ * Builds and records the local release state, rolling every failure back before anything is pushed.
+ * @param {{scripts?: Record<string, string>}} packageJson Package manifest.
+ * @param {string} nextVersion Exact next version.
+ * @param {string} releaseTag Exact release tag.
+ * @param {string[]} existingVersionManifests Manifests eligible for the release commit.
+ * @param {string} preReleaseHead Clean HEAD to restore on failure.
+ */
+function prepareLocalRelease(packageJson, nextVersion, releaseTag, existingVersionManifests, preReleaseHead) {
+  try {
+    installDependencies()
+    run(`npm version ${nextVersion} --no-git-tag-version`)
+    runExplicitBuildIfNeeded(packageJson)
+    run("npm publish --dry-run")
+    ensureOnlyVersionManifestsChanged(existingVersionManifests)
+    commitVersionFiles(existingVersionManifests)
+    ensureNoStrayReleaseChanges()
+    run(`git tag -a ${releaseTag} -m ${releaseTag}`)
+  } catch (error) {
+    rollbackLocalReleaseState(releaseTag, preReleaseHead, error)
+  }
+}
 
-  // Verify the package is publishable *before* creating the release commit or tag, so a failed
-  // dry-run leaves no local tag that would poison the next version derivation. The dry-run pushes no
-  // Git refs and publishes no package, though its lifecycle scripts may have external side effects.
-  run("npm publish --dry-run")
+/**
+ * Attempts the atomic release push while preserving exact local state on an ambiguous push error.
+ * @param {string} releaseTag Exact prepared release tag.
+ */
+function pushPreparedRelease(releaseTag) {
+  try {
+    run(`git push --atomic origin master ${releaseTag}`)
+  } catch (error) {
+    throw new Error(
+      `release-patch: the atomic push for ${releaseTag} failed with an ambiguous remote outcome. The exact clean ` +
+      "release commit and tag were preserved locally; run `release-patch --resume` to verify or push those same refs " +
+      "and finish the release without bumping again.",
+      {cause: error}
+    )
+  }
+}
 
-  // Before committing, refuse if the version bump, build or dry-run changed anything beyond the
-  // originally existing version manifests, so stray files or a newly generated lockfile can never
-  // reach the commit, tag, push or publish.
-  ensureOnlyVersionManifestsChanged(existingVersionManifests)
+/**
+ * Restores the exact clean pre-release checkout after any failure before the atomic release push.
+ * Since the tree was proven clean beforehand, `git clean -fd` removes only non-ignored files emitted
+ * by this attempt; ignored dependency/build output is harmless to the clean-tree preflight.
+ * @param {string} releaseTag The not-remotely-pushed release tag, if it was created.
+ * @param {string} preReleaseHead The clean synced HEAD before local release work.
+ * @param {unknown} releaseError The original failure.
+ * @returns {never} Always throws after rollback.
+ */
+function rollbackLocalReleaseState(releaseTag, preReleaseHead, releaseError) {
+  try {
+    if (gitSucceeds(["show-ref", "--verify", "--quiet", `refs/tags/${releaseTag}`])) {
+      run(`git tag -d ${releaseTag}`)
+    }
+    run(`git reset --hard ${preReleaseHead}`)
+    run("git clean -fd")
+  } catch (rollbackError) {
+    throw new Error(
+      `release-patch: the release failed before its atomic push, and automatic cleanup also failed. No release refs ` +
+      "were intentionally pushed or published. Resolve the reported Git cleanup failure before retrying the same command.",
+      {cause: rollbackError}
+    )
+  }
 
-  // Commit exactly the captured existing manifests, then re-verify the tree is clean before tagging.
-  commitVersionFiles(existingVersionManifests)
-  ensureNoStrayReleaseChanges()
+  throw new Error(
+    `release-patch: the release failed before its atomic push. Local version changes, release commit, tag and ` +
+    `non-ignored generated files were rolled back to ${preReleaseHead}; rerun the exact same release-patch command ` +
+    `after resolving the original failure. Original failure: ${errorMessage(releaseError)}`,
+    {cause: releaseError}
+  )
+}
 
-  // Create an annotated tag on the release commit before pushing anything; if tagging fails, the
-  // stranded release commit is rolled back to the captured clean pre-release HEAD.
-  createReleaseTagOrRollback(releaseTag, preReleaseHead)
-
-  pushPublishAndVerify(packageName, nextVersion, releaseTag)
+/**
+ * @param {unknown} error Failure value.
+ * @returns {string} Its diagnostic text.
+ */
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error)
 }
 
 /**
@@ -1035,7 +1110,7 @@ function ensureResumeMatchesTaggedCommit(packageJson, releaseTag, version) {
 
 /** Runs the release, choosing a normal patch release or a resume based on the CLI arguments. */
 function main() {
-  const {resume, reconcilePublished} = parseCliArgs(process.argv)
+  const {resume, reconcilePublished, expectedGitHead} = parseCliArgs(process.argv)
 
   // Refuse to run against a dirty tree before touching any branch, so stray edits can never leak into
   // the release commit and `git checkout master` can never clobber uncommitted work.
@@ -1063,7 +1138,7 @@ function main() {
     const latest = latestAnnotatedReleaseTag()
 
     if (reconcilePublished !== undefined) {
-      runReconciledRelease(packageJson, packageName, reconcilePublished, latest)
+      runReconciledRelease(packageJson, packageName, reconcilePublished, /** @type {string} */ (expectedGitHead), latest)
     } else {
       runNormalRelease(packageJson, packageName, latest)
     }
