@@ -122,6 +122,7 @@ if (command === "install") {
 }
 
 if (command === "run" && args[1] === "build") {
+  if (process.env.BUILD_FAIL === "1") process.exit(1)
   if (process.env.BUILD_STRAY_FILE) writeFileSync(join(process.cwd(), process.env.BUILD_STRAY_FILE), "stray\\n")
   if (process.env.BUILD_IGNORED_FILE) writeFileSync(join(process.cwd(), process.env.BUILD_IGNORED_FILE), "ignored\\n")
   if (process.env.BUILD_TRACKED_FILE) writeFileSync(join(process.cwd(), process.env.BUILD_TRACKED_FILE), "mutated by build\\n")
@@ -129,6 +130,7 @@ if (command === "run" && args[1] === "build") {
 }
 
 if (command === "version") {
+  if (process.env.NPM_VERSION_FAIL === "1") process.exit(1)
   const nextVersion = args[1]
   for (const file of ["package.json", "package-lock.json", "npm-shrinkwrap.json"]) {
     const path = join(process.cwd(), file)
@@ -168,6 +170,10 @@ if (command === "publish") {
 
 if (command === "view") {
   const spec = args[1]
+  if (args.slice(2).join(" ") === "version gitHead --json" && process.env.NPM_METADATA_VERSION) {
+    process.stdout.write(JSON.stringify({version: process.env.NPM_METADATA_VERSION, gitHead: process.env.NPM_METADATA_GIT_HEAD}) + "\\n")
+    process.exit(0)
+  }
   const errorVersion = process.env.NPM_VIEW_ERROR_VERSION
   if (errorVersion && spec.endsWith("@" + errorVersion)) {
     process.stderr.write((process.env.NPM_VIEW_ERROR_STDERR || "") + "\\n")
@@ -213,6 +219,7 @@ const args = process.argv.slice(2)
 appendFileSync(process.env.COMMAND_LOG, "git " + args.join(" ") + "\\n")
 
 try {
+  if (process.env.GIT_ATOMIC_PUSH_FAIL === "1" && args[0] === "push" && args.includes("--atomic")) process.exit(1)
   execFileSync(process.env.REAL_GIT, args, {stdio: "inherit"})
 } catch (error) {
   process.exit(typeof error.status === "number" ? error.status : 1)
@@ -1026,6 +1033,190 @@ test("refuses to release when the working tree has uncommitted changes", () => {
 test("rejects unknown CLI arguments before doing anything", () => {
   withRelease({scripts: {}, packageLock: true, annotatedTags: ["v1.0.0"]}, (context) => {
     assertBlocked(context, /unknown argument "--bogus"/u, {args: ["--bogus"]})
+  })
+})
+
+/**
+ * Adds an untagged published baseline commit followed by newer development on master.
+ * @param {ScenarioContext} context The scenario context.
+ * @param {{name?: string, baselineName?: string, baselineVersion?: string, currentVersion?: string, currentScripts?: Record<string, string>}} [options] Fixture values.
+ * @returns {string} The untagged baseline commit SHA.
+ */
+function addUntaggedPublishedBaseline(context, options) {
+  const fixture = Object.assign({name: "my-pkg", baselineName: "my-pkg", baselineVersion: "0.5.10", currentVersion: "0.6.0", currentScripts: {}}, options)
+  const name = fixture.name
+  const baselineVersion = fixture.baselineVersion
+
+  writeFileSync(join(context.work, "package.json"), JSON.stringify({name: fixture.baselineName, version: baselineVersion, scripts: {}}, null, 2) + "\n")
+  git(context.work, ["add", "package.json"])
+  git(context.work, ["commit", "-m", `release ${baselineVersion} without tag`])
+  const baselineHead = revParse(context.work, "HEAD")
+
+  writeFileSync(join(context.work, "package.json"), JSON.stringify({name, version: fixture.currentVersion, scripts: fixture.currentScripts}, null, 2) + "\n")
+  git(context.work, ["add", "package.json"])
+  git(context.work, ["commit", "-m", "later development"])
+  git(context.work, ["push", "origin", "master"])
+  writeFileSync(context.registryFile, JSON.stringify([`${name}@0.5.9`, `${name}@${baselineVersion}`]))
+
+  return baselineHead
+}
+
+/**
+ * Runs the guarded reconciliation mode and asserts it fails without release mutations.
+ * @param {ScenarioContext} context The scenario context.
+ * @param {RegExp} pattern Expected diagnostic.
+ * @param {string} gitHead Registry gitHead fixture.
+ */
+function assertReconciliationBlocked(context, pattern, gitHead) {
+  assertBlocked(context, pattern, {
+    args: ["--reconcile-published", "0.5.10", "--expected-git-head", gitHead],
+    env: {NPM_METADATA_VERSION: "0.5.10", NPM_METADATA_GIT_HEAD: gitHead}
+  })
+}
+
+test("reconciles an exact untagged published baseline and releases the following patch", () => {
+  withRelease({name: "my-pkg", version: "0.5.9", scripts: {}, packageLock: true, annotatedTags: ["v0.5.9"]}, (context) => {
+    const baselineHead = addUntaggedPublishedBaseline(context)
+    const commands = release(context, {
+      args: ["--reconcile-published", "0.5.10", "--expected-git-head", baselineHead],
+      env: {NPM_METADATA_VERSION: "0.5.10", NPM_METADATA_GIT_HEAD: baselineHead}
+    })
+
+    assert.equal(git(context.origin, ["cat-file", "-t", "v0.5.10"]).trim(), "tag")
+    assert.equal(revParse(context.origin, "v0.5.10^{commit}"), baselineHead)
+    assert.ok(registryOf(context).includes("my-pkg@0.5.11"))
+    assert.ok(commands.includes("npm view my-pkg@0.5.10 version gitHead --json"))
+    assert.ok(commands.includes(`git tag -a v0.5.10 ${baselineHead} -m v0.5.10`))
+    assert.ok(commands.includes("git push origin v0.5.10"))
+    assert.ok(commands.indexOf("git push origin v0.5.10") < commands.indexOf("npm version 0.5.11 --no-git-tag-version"))
+  })
+})
+
+test("reconciliation rejects registry gitHead that differs from the operator's expected baseline SHA", () => {
+  withRelease({name: "my-pkg", version: "0.5.9", scripts: {}, packageLock: true, annotatedTags: ["v0.5.9"]}, (context) => {
+    const baselineHead = addUntaggedPublishedBaseline(context)
+    const differentExpectedHead = revParse(context.work, "HEAD")
+
+    assertBlocked(context, /registry gitHead .* does not exactly match.*expected baseline/u, {
+      args: ["--reconcile-published", "0.5.10", "--expected-git-head", differentExpectedHead],
+      env: {NPM_METADATA_VERSION: "0.5.10", NPM_METADATA_GIT_HEAD: baselineHead}
+    })
+  })
+})
+
+test("reconciliation rejects an unpublished preceding annotated tag", () => {
+  withRelease({name: "my-pkg", version: "0.5.9", scripts: {}, packageLock: true, annotatedTags: ["v0.5.9"]}, (context) => {
+    const baselineHead = addUntaggedPublishedBaseline(context)
+    writeFileSync(context.registryFile, JSON.stringify(["my-pkg@0.5.10"]))
+    assertReconciliationBlocked(context, /preceding release tag v0\.5\.9 is not published/u, baselineHead)
+  })
+})
+
+test("reconciliation fails closed before tagging when registry provenance is incomplete", () => {
+  withRelease({name: "my-pkg", version: "0.5.9", scripts: {}, packageLock: true, annotatedTags: ["v0.5.9"]}, (context) => {
+    const baselineHead = addUntaggedPublishedBaseline(context)
+    assertBlocked(context, /registry metadata.*gitHead/u, {
+      args: ["--reconcile-published", "0.5.10", "--expected-git-head", baselineHead],
+      env: {NPM_METADATA_VERSION: "0.5.10", NPM_METADATA_GIT_HEAD: ""}
+    })
+  })
+})
+
+test("reconciliation rejects a gitHead outside origin master history", () => {
+  withRelease({name: "my-pkg", version: "0.5.9", scripts: {}, packageLock: true, annotatedTags: ["v0.5.9"]}, (context) => {
+    addUntaggedPublishedBaseline(context)
+    git(context.work, ["checkout", "--orphan", "foreign"])
+    git(context.work, ["commit", "--allow-empty", "-m", "foreign history"])
+    const foreignHead = revParse(context.work, "HEAD")
+    git(context.work, ["checkout", "master"])
+
+    assertReconciliationBlocked(context, /not an ancestor of origin\/master/u, foreignHead)
+  })
+})
+
+test("reconciliation rejects a registry gitHead that does not exist locally after fetch", () => {
+  withRelease({name: "my-pkg", version: "0.5.9", scripts: {}, packageLock: true, annotatedTags: ["v0.5.9"]}, (context) => {
+    addUntaggedPublishedBaseline(context)
+    assertReconciliationBlocked(context, /gitHead f{40}.*missing from this repository/u, "f".repeat(40))
+  })
+})
+
+test("reconciliation rejects package identity or version mismatches at registry gitHead", () => {
+  withRelease({name: "my-pkg", version: "0.5.9", scripts: {}, packageLock: true, annotatedTags: ["v0.5.9"]}, (context) => {
+    const wrongPackageHead = addUntaggedPublishedBaseline(context, {baselineName: "other-pkg"})
+    assertReconciliationBlocked(context, /package\.json at .* declares name other-pkg/u, wrongPackageHead)
+  })
+})
+
+test("reconciliation rejects a version mismatch at registry gitHead", () => {
+  withRelease({name: "my-pkg", version: "0.5.9", scripts: {}, packageLock: true, annotatedTags: ["v0.5.9"]}, (context) => {
+    const wrongVersionHead = addUntaggedPublishedBaseline(context, {baselineVersion: "0.5.8"})
+    assertReconciliationBlocked(context, /declares version 0\.5\.8, not registry version 0\.5\.10/u, wrongVersionHead)
+  })
+})
+
+test("reconciliation refuses an existing tag instead of moving or replacing it", () => {
+  withRelease({name: "my-pkg", version: "0.5.9", scripts: {}, packageLock: true, annotatedTags: ["v0.5.9"]}, (context) => {
+    const baselineHead = addUntaggedPublishedBaseline(context)
+    git(context.work, ["tag", "-a", "v0.5.10", "v0.5.9^{commit}", "-m", "wrong target"])
+    git(context.work, ["push", "origin", "v0.5.10"])
+
+    assertReconciliationBlocked(context, /tag v0\.5\.10 already exists/u, baselineHead)
+    assert.equal(revParse(context.origin, "v0.5.10^{commit}"), revParse(context.origin, "v0.5.9^{commit}"))
+  })
+})
+
+test("reconciliation preserves duplicate protection before creating the baseline tag", () => {
+  withRelease({name: "my-pkg", version: "0.5.9", scripts: {}, packageLock: true, annotatedTags: ["v0.5.9"]}, (context) => {
+    const baselineHead = addUntaggedPublishedBaseline(context)
+    writeFileSync(context.registryFile, JSON.stringify(["my-pkg@0.5.9", "my-pkg@0.5.10", "my-pkg@0.5.11"]))
+
+    assertReconciliationBlocked(context, /my-pkg@0\.5\.11 is already published/u, baselineHead)
+    assert.equal(git(context.work, ["tag", "-l", "v0.5.10"]).trim(), "")
+  })
+})
+
+const reconciliationRetryFailures = /** @type {Array<[string, Record<string, string>]>} */ ([
+  ["npm version", {NPM_VERSION_FAIL: "1"}],
+  ["build", {BUILD_FAIL: "1"}],
+  ["publish dry-run", {NPM_DRYRUN_FAIL: "1"}]
+])
+
+for (const [failureName, env] of reconciliationRetryFailures) {
+  test(`reconciliation rolls back a failed ${failureName} so the exact invocation can be retried`, () => {
+    withRelease({name: "my-pkg", version: "0.5.9", scripts: {build: "tsc"}, packageLock: true, annotatedTags: ["v0.5.9"]}, (context) => {
+      const baselineHead = addUntaggedPublishedBaseline(context, {currentScripts: {build: "tsc"}})
+      const args = ["--reconcile-published", "0.5.10", "--expected-git-head", baselineHead]
+      const metadataEnv = {NPM_METADATA_VERSION: "0.5.10", NPM_METADATA_GIT_HEAD: baselineHead}
+      const first = runCli(context, {args, env: {...metadataEnv, ...env}})
+
+      assert.ok(first.failure, `the ${failureName} fixture must fail`)
+      assert.equal(git(context.work, ["status", "--porcelain"]).trim(), "", "rollback must restore a clean tree")
+      assert.equal(git(context.work, ["tag", "-l", "v0.5.11"]).trim(), "", "rollback must remove the local release tag")
+      assert.equal(revParse(context.work, "HEAD"), revParse(context.origin, "master"), "rollback must restore synced master")
+
+      clearCommands(context)
+      release(context, {args, env: metadataEnv})
+      assert.ok(registryOf(context).includes("my-pkg@0.5.11"), "the exact invocation must succeed on retry")
+    })
+  })
+}
+
+test("an ambiguous atomic push failure preserves exact state for package-owned resume recovery", () => {
+  withRelease({name: "my-pkg", version: "0.5.9", scripts: {}, packageLock: true, annotatedTags: ["v0.5.9"]}, (context) => {
+    const baselineHead = addUntaggedPublishedBaseline(context)
+    const args = ["--reconcile-published", "0.5.10", "--expected-git-head", baselineHead]
+    const metadataEnv = {NPM_METADATA_VERSION: "0.5.10", NPM_METADATA_GIT_HEAD: baselineHead}
+    const first = runCli(context, {args, env: {...metadataEnv, GIT_ATOMIC_PUSH_FAIL: "1"}})
+
+    assert.ok(first.failure, "the atomic push fixture must fail")
+    assert.match(first.output, /atomic push.*--resume/u)
+    assert.equal(git(context.work, ["status", "--porcelain"]).trim(), "", "the release state must stay clean")
+    assert.equal(revParse(context.work, "v0.5.11^{commit}"), revParse(context.work, "HEAD"), "the exact release tag must remain")
+
+    clearCommands(context)
+    release(context, {resume: true})
+    assert.ok(registryOf(context).includes("my-pkg@0.5.11"), "resume must finish the exact release")
   })
 })
 
