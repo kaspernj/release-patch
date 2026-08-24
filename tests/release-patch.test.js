@@ -85,6 +85,7 @@ function writeExecutable(path, contents) {
  */
 function fakeNpmScript() {
   return `#!/usr/bin/env node
+import {execFileSync} from "node:child_process"
 import {appendFileSync, existsSync, readFileSync, writeFileSync} from "node:fs"
 import {join} from "node:path"
 
@@ -151,6 +152,9 @@ if (command === "publish") {
     }
     if (process.env.DRYRUN_STRAY_FILE) writeFileSync(join(process.cwd(), process.env.DRYRUN_STRAY_FILE), "stray\\n")
     if (process.env.DRYRUN_TRACKED_FILE) writeFileSync(join(process.cwd(), process.env.DRYRUN_TRACKED_FILE), "mutated by dry-run\\n")
+    if (process.env.DRYRUN_MOVE_HEAD) execFileSync(process.env.REAL_GIT, ["checkout", "--detach", process.env.DRYRUN_MOVE_HEAD], {stdio: "inherit"})
+    if (process.env.DRYRUN_MOVE_MASTER) execFileSync(process.env.REAL_GIT, ["update-ref", "refs/heads/master", process.env.DRYRUN_MOVE_MASTER], {stdio: "inherit"})
+    if (process.env.DRYRUN_MOVE_RELEASE_TAG) execFileSync(process.env.REAL_GIT, ["update-ref", "refs/tags/v1.0.0", process.env.DRYRUN_MOVE_RELEASE_TAG], {stdio: "inherit"})
     process.exit(0)
   }
   if (process.env.NPM_PUBLISH_FAIL === "1") {
@@ -1447,6 +1451,30 @@ function advanceMasterAfterReleaseTag(context) {
 }
 
 /**
+ * Advances master after the release tag and leaves the caller on a branch at that exact commit.
+ * @param {ScenarioContext} context The scenario context.
+ * @returns {string} The advanced master and caller commit SHA.
+ */
+function prepareAdvancedResumeCaller(context) {
+  const advancedMaster = advanceMasterAfterReleaseTag(context)
+  git(context.work, ["checkout", "-b", "caller"])
+
+  return advancedMaster
+}
+
+/**
+ * Runs resume from a caller branch after master advances, with the requested failing gate mutation.
+ * @param {ScenarioContext} context The scenario context.
+ * @param {Record<string, string>} env Environment controls for the failure.
+ * @returns {{advancedMaster: string, failure?: Error & {status?: number}, stdout: string, stderr: string, output: string}} The resume result and caller commit.
+ */
+function runAdvancedResumeFailure(context, env) {
+  const advancedMaster = prepareAdvancedResumeCaller(context)
+
+  return {advancedMaster, ...runCli(context, {resume: true, env})}
+}
+
+/**
  * Asserts resume returned to the caller's exact branch/commit with a clean sole worktree.
  * @param {ScenarioContext} context The scenario context.
  * @param {string} callerHead Expected caller commit.
@@ -1464,15 +1492,17 @@ function assertCallerCheckoutRestored(context, callerHead) {
 test("resume publishes the exact tagged tree after master advances and restores the caller checkout", () => {
   withRelease({name: "my-pkg", version: "1.0.0", scripts: {}, packageLock: true, annotatedTags: ["v1.0.0"], published: []}, (context) => {
     const taggedHead = revParse(context.work, "v1.0.0^{commit}")
-    const advancedMaster = advanceMasterAfterReleaseTag(context)
-    git(context.work, ["checkout", "-b", "caller"])
+    const tagObject = revParse(context.work, "refs/tags/v1.0.0")
+    const advancedMaster = prepareAdvancedResumeCaller(context)
 
     const commands = release(context, {resume: true})
 
     assert.ok(registryOf(context).includes("my-pkg@1.0.0"), "resume must publish the tagged version")
     assert.equal(commands.includes("npm run build"), false, "resume must not run a script added only on later master")
     assert.ok(commands.some((command) => command.startsWith("git worktree add --detach ") && command.endsWith(` ${taggedHead}`)))
-    assert.ok(commands.includes("git push --atomic origin master v1.0.0"))
+    assert.ok(commands.includes(
+      `git push --atomic origin ${advancedMaster}:refs/heads/master ${tagObject}:refs/tags/v1.0.0`
+    ))
     assert.equal(revParse(context.origin, "master"), advancedMaster, "resume must not rewind advanced master")
     assertCallerCheckoutRestored(context, advancedMaster)
   })
@@ -1480,10 +1510,7 @@ test("resume publishes the exact tagged tree after master advances and restores 
 
 test("resume restores the caller checkout and removes the tagged worktree after a gate failure", () => {
   withRelease({name: "my-pkg", version: "1.0.0", scripts: {}, packageLock: true, annotatedTags: ["v1.0.0"], published: []}, (context) => {
-    const advancedMaster = advanceMasterAfterReleaseTag(context)
-    git(context.work, ["checkout", "-b", "caller"])
-
-    const {failure, output} = runCli(context, {resume: true, env: {NPM_DRYRUN_FAIL: "1"}})
+    const {advancedMaster, failure, output} = runAdvancedResumeFailure(context, {NPM_DRYRUN_FAIL: "1"})
 
     assert.ok(failure, "the publish dry-run fixture must fail")
     assert.match(output, /publish dry-run failed/u)
@@ -1491,6 +1518,53 @@ test("resume restores the caller checkout and removes the tagged worktree after 
     assert.equal(commandsOf(context).includes("npm publish"), false)
     assert.equal(ranCommand(commandsOf(context), "git push"), false)
     assertCallerCheckoutRestored(context, advancedMaster)
+  })
+})
+
+test("resume refuses a clean detached HEAD move after its gates and restores the caller checkout", () => {
+  withRelease({name: "my-pkg", version: "1.0.0", scripts: {}, packageLock: true, annotatedTags: ["v1.0.0"], published: []}, (context) => {
+    const advancedMaster = advanceMasterAfterReleaseTag(context)
+    git(context.work, ["checkout", "-b", "caller"])
+    const {failure, output} = runCli(context, {resume: true, env: {DRYRUN_MOVE_HEAD: advancedMaster}})
+
+    assert.ok(failure, "a clean HEAD move away from the validated tag must block resume")
+    assert.match(output, /worktree HEAD.*exact validated commit .* tagged v1\.0\.0/u)
+    assert.equal(ranCommand(commandsOf(context), "git push"), false)
+    assert.equal(commandsOf(context).includes("npm publish"), false)
+    assert.equal(registryOf(context).includes("my-pkg@1.0.0"), false)
+    assertCallerCheckoutRestored(context, advancedMaster)
+  })
+})
+
+test("resume pushes the exact validated master and tag objects when local refs move concurrently", () => {
+  withRelease({name: "my-pkg", version: "1.0.0", scripts: {}, packageLock: true, annotatedTags: ["v1.0.0"], published: [], pushTags: false}, (context) => {
+    const validatedMaster = revParse(context.work, "master")
+    const validatedTagObject = revParse(context.work, "refs/tags/v1.0.0")
+
+    git(context.work, ["checkout", "-b", "moving-target"])
+    writeManifest(context.work, {name: "other-pkg", version: "9.9.9", scripts: {}})
+    git(context.work, ["add", "package.json"])
+    git(context.work, ["commit", "-m", "create a different local release target"])
+    const movedMaster = revParse(context.work, "HEAD")
+    git(context.work, ["tag", "-a", "alternate-object", "-m", "alternate-object"])
+    const movedTagObject = revParse(context.work, "refs/tags/alternate-object")
+    git(context.work, ["checkout", "master"])
+    git(context.work, ["checkout", "-b", "caller"])
+
+    const commands = release(context, {
+      resume: true,
+      env: {DRYRUN_MOVE_MASTER: movedMaster, DRYRUN_MOVE_RELEASE_TAG: movedTagObject}
+    })
+
+    assert.ok(registryOf(context).includes("my-pkg@1.0.0"), "resume must publish only the validated tagged package")
+    assert.equal(revParse(context.work, "master"), movedMaster, "the fixture must move the local master ref")
+    assert.equal(revParse(context.work, "refs/tags/v1.0.0"), movedTagObject, "the fixture must move the local tag ref")
+    assert.equal(revParse(context.origin, "master"), validatedMaster, "the moved local master object must not be pushed")
+    assert.equal(revParse(context.origin, "refs/tags/v1.0.0"), validatedTagObject, "the moved local tag object must not be pushed")
+    assert.ok(commands.includes(
+      `git push --atomic origin ${validatedMaster}:refs/heads/master ${validatedTagObject}:refs/tags/v1.0.0`
+    ))
+    assertCallerCheckoutRestored(context, validatedMaster)
   })
 })
 

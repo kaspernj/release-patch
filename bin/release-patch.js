@@ -555,23 +555,6 @@ function ensureNoStrayReleaseChanges() {
 }
 
 /**
- * Pushes the exact release commit and its annotated tag to origin atomically, then publishes and
- * verifies. The push never forces and is a no-op when origin already has both refs. If the real
- * publish fails after the push, the commit and tag are already public, so the error explains how to
- * finish with `release-patch --resume` and the non-zero exit is preserved.
- * @param {string} packageName The validated package name.
- * @param {string} version The exact version being released.
- * @param {string} releaseTag The annotated release tag (`v<version>`).
- */
-function pushPublishAndVerify(packageName, version, releaseTag) {
-  // Push the release commit and its exact tag together atomically, never forcing, so master is
-  // never published without the matching release tag if the tag push would fail on its own.
-  run(`git push --atomic origin master ${releaseTag}`)
-
-  publishAndVerify(packageName, version, releaseTag)
-}
-
-/**
  * Publishes after the release refs are public, preserving resume recovery on any registry failure.
  * @param {string} packageName The validated package name.
  * @param {string} version The exact version being released.
@@ -1063,11 +1046,13 @@ function restoreCallerCheckout(callerCheckout) {
 }
 
 /**
- * Requires a resume tag to belong to current synced master history and returns its exact commit.
+ * Resolves the annotated tag object once, derives its commit from that immutable object, and requires
+ * the commit to belong to the exact synced master history that resume will push.
  * @param {{tag: string, version: {major: number, minor: number, patch: number}} | null} latest Latest annotated tag.
- * @returns {string} The exact tagged commit SHA.
+ * @param {string} masterCommit Exact synced master commit SHA.
+ * @returns {{tagCommit: string, tagObject: string}} The immutable annotated tag object and its commit.
  */
-function resumeTagCommitOnCurrentMaster(latest) {
+function resumeTagObjectsOnCurrentMaster(latest, masterCommit) {
   if (latest === null) {
     throw new Error(
       "release-patch: --resume needs an existing annotated vX.Y.Z release tag to publish, but none was found. " +
@@ -1075,15 +1060,16 @@ function resumeTagCommitOnCurrentMaster(latest) {
     )
   }
 
-  const tagCommit = runCaptureArgs("git", ["rev-parse", "--verify", `${latest.tag}^{commit}`]).trim()
-  if (!gitSucceeds(["merge-base", "--is-ancestor", tagCommit, "HEAD"])) {
+  const tagObject = runCaptureArgs("git", ["rev-parse", "--verify", `refs/tags/${latest.tag}^{tag}`]).trim()
+  const tagCommit = runCaptureArgs("git", ["rev-parse", "--verify", `${tagObject}^{commit}`]).trim()
+  if (!gitSucceeds(["merge-base", "--is-ancestor", tagCommit, masterCommit])) {
     throw new Error(
       `release-patch: --resume cannot publish ${latest.tag} because its commit ${tagCommit} is not an ancestor of ` +
       "current master; refusing to publish a release outside authoritative master history."
     )
   }
 
-  return tagCommit
+  return {tagCommit, tagObject}
 }
 
 /**
@@ -1192,13 +1178,19 @@ function captureResumeError(action) {
  */
 function runIsolatedResume(context) {
   ensureLatestMaster()
+  const masterCommit = runCaptureArgs("git", ["rev-parse", "--verify", "HEAD"]).trim()
   const masterPackageJson = readValidatedPackageJson()
   ensureNpmAuth()
   fetchTags()
 
   const latest = latestAnnotatedReleaseTag()
-  const tagCommit = resumeTagCommitOnCurrentMaster(latest)
-  const release = /** @type {{tag: string, version: {major: number, minor: number, patch: number}}} */ (latest)
+  const {tagCommit, tagObject} = resumeTagObjectsOnCurrentMaster(latest, masterCommit)
+  const release = {
+    .../** @type {{tag: string, version: {major: number, minor: number, patch: number}}} */ (latest),
+    masterCommit,
+    tagCommit,
+    tagObject
+  }
   ensureResumeMasterMetadata(masterPackageJson, release)
 
   context.temporaryRoot = mkdtempSync(join(tmpdir(), "release-patch-resume-"))
@@ -1247,7 +1239,7 @@ function runResumeMode() {
  * gates run, master/tag are pushed atomically, and the exact tagged version is published and verified.
  * @param {{version?: string, scripts?: Record<string, string>}} packageJson The validated manifest.
  * @param {string} packageName The validated package name.
- * @param {{tag: string, version: {major: number, minor: number, patch: number}} | null} latest The latest annotated release tag.
+ * @param {{tag: string, version: {major: number, minor: number, patch: number}, masterCommit: string, tagCommit: string, tagObject: string} | null} latest The validated immutable resume objects.
  */
 function runResume(packageJson, packageName, latest) {
   if (latest === null) {
@@ -1260,12 +1252,13 @@ function runResume(packageJson, packageName, latest) {
   const version = versionString(latest.version)
   const releaseTag = latest.tag
 
-  ensureResumeMatchesTaggedCommit(packageJson, releaseTag, version)
+  ensureResumeMatchesTaggedCommit(packageJson, releaseTag, version, latest.tagCommit)
 
   // If the exact version is already on npm, resume is a verified no-op: make sure origin has the
   // refs (a no-op when already pushed) and confirm the published version, without republishing.
   if (lookupPublishedVersion(`${packageName}@${version}`).trim() !== "") {
-    run(`git push --atomic origin master ${releaseTag}`)
+    ensureResumeTreeMatchesTag(releaseTag, latest.tagCommit)
+    pushExactResumeRefs(latest)
     verifyPublished(packageName, version)
 
     return
@@ -1278,20 +1271,28 @@ function runResume(packageJson, packageName, latest) {
   // Install, build and the dry-run can regenerate a lockfile or emit tracked/non-ignored files. Before
   // pushing or publishing, require the tree to still exactly match the tagged commit so resume can
   // never ship a tree the tag does not record.
-  ensureResumeTreeMatchesTag(releaseTag)
+  ensureResumeTreeMatchesTag(releaseTag, latest.tagCommit)
 
-  pushPublishAndVerify(packageName, version, releaseTag)
+  pushExactResumeRefs(latest)
+  ensureResumeTreeMatchesTag(releaseTag, latest.tagCommit)
+  publishAndVerify(packageName, version, releaseTag)
 }
 
 /**
- * After resume's install, build and publish dry-run, refuses to push or publish unless the entire
- * non-ignored working tree still exactly matches the tagged commit. `ensureResumeMatchesTaggedCommit`
- * has already proven HEAD is the tagged commit, so an empty `git status --porcelain` means the tree
- * matches the tag; any tracked change or non-ignored untracked file means install, build or the
- * dry-run drifted the tree away from the tag and the release must not proceed.
- * @param {string} releaseTag The tag being resumed (`v<version>`), which HEAD is pinned to.
+ * Refuses to push or publish unless both HEAD and the non-ignored working tree still match the exact
+ * tagged commit validated before lifecycle gates ran.
+ * @param {string} releaseTag The tag being resumed (`v<version>`).
+ * @param {string} tagCommit The immutable tagged commit validated for this resume.
  */
-function ensureResumeTreeMatchesTag(releaseTag) {
+function ensureResumeTreeMatchesTag(releaseTag, tagCommit) {
+  const headCommit = runCaptureArgs("git", ["rev-parse", "--verify", "HEAD"]).trim()
+  if (headCommit !== tagCommit) {
+    throw new Error(
+      `release-patch: resume worktree HEAD is ${headCommit}, not the exact validated commit ${tagCommit} tagged ` +
+      `${releaseTag}; refusing to push or publish after the detached worktree moved.`
+    )
+  }
+
   const status = runCapture("git status --porcelain")
 
   if (status.trim() !== "") {
@@ -1305,15 +1306,31 @@ function ensureResumeTreeMatchesTag(releaseTag) {
 }
 
 /**
+ * Atomically and non-force pushes the exact validated objects to their intended remote refs. Object
+ * IDs as refspec sources prevent concurrent local master or tag movement from changing what is sent;
+ * ordinary non-force receive checks still reject a conflicting remote branch or tag update.
+ * @param {{tag: string, masterCommit: string, tagObject: string}} release Validated immutable refs.
+ */
+function pushExactResumeRefs(release) {
+  runArgs("git", [
+    "push",
+    "--atomic",
+    "origin",
+    `${release.masterCommit}:refs/heads/master`,
+    `${release.tagObject}:refs/tags/${release.tag}`
+  ])
+}
+
+/**
  * Refuses a resume unless the isolated worktree HEAD and its package.json match the exact tag, so
  * resume can never publish a tree the tag does not record.
  * @param {{version?: string}} packageJson The validated manifest.
  * @param {string} releaseTag The tag to resume (`v<version>`).
  * @param {string} version The exact version the tag names.
+ * @param {string} tagCommit The immutable tag commit validated before creating the worktree.
  */
-function ensureResumeMatchesTaggedCommit(packageJson, releaseTag, version) {
-  const tagCommit = runCapture(`git rev-parse --verify ${releaseTag}^{commit}`).trim()
-  const headCommit = runCapture("git rev-parse --verify HEAD").trim()
+function ensureResumeMatchesTaggedCommit(packageJson, releaseTag, version, tagCommit) {
+  const headCommit = runCaptureArgs("git", ["rev-parse", "--verify", "HEAD"]).trim()
 
   if (tagCommit !== headCommit) {
     throw new Error(
