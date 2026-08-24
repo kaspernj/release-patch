@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import {execFileSync} from "node:child_process"
+import {execFileSync, spawn} from "node:child_process"
 import {chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync} from "node:fs"
 import {tmpdir} from "node:os"
 import {dirname, join, resolve} from "node:path"
@@ -13,6 +13,8 @@ const projectPackageJson = JSON.parse(readFileSync(join(projectRoot, "package.js
 
 // The version manifests npm's bump touches and that the release commit is expected to carry.
 const versionManifestFiles = ["package.json", "package-lock.json", "npm-shrinkwrap.json"]
+
+/** @typedef {"SIGINT" | "SIGTERM"} TestTerminationSignal */
 
 /**
  * @typedef {object} ScenarioOptions
@@ -105,6 +107,13 @@ function specVersion(spec) {
   return spec.slice(spec.lastIndexOf("@") + 1)
 }
 
+function pauseAt(stage) {
+  if (process.env.NPM_PAUSE_AT !== stage) return
+  writeFileSync(process.env.NPM_PAUSE_MARKER, stage)
+  const wait = new Int32Array(new SharedArrayBuffer(4))
+  while (!existsSync(process.env.NPM_PAUSE_RELEASE)) Atomics.wait(wait, 0, 0, 10)
+}
+
 const command = args[0]
 
 if (command === "whoami") {
@@ -116,6 +125,7 @@ if (command === "login") {
 }
 
 if (command === "install") {
+  pauseAt("install")
   if (process.env.INSTALL_STRAY_FILE) writeFileSync(join(process.cwd(), process.env.INSTALL_STRAY_FILE), "stray\\n")
   if (process.env.INSTALL_TRACKED_FILE) writeFileSync(join(process.cwd(), process.env.INSTALL_TRACKED_FILE), "mutated by install\\n")
   if (process.env.INSTALL_LOCKFILE) writeFileSync(join(process.cwd(), "package-lock.json"), JSON.stringify({name: "generated", version: "0.0.0"}) + "\\n")
@@ -123,6 +133,7 @@ if (command === "install") {
 }
 
 if (command === "run" && args[1] === "build") {
+  pauseAt("build")
   if (process.env.BUILD_FAIL === "1") process.exit(1)
   if (process.env.BUILD_STRAY_FILE) writeFileSync(join(process.cwd(), process.env.BUILD_STRAY_FILE), "stray\\n")
   if (process.env.BUILD_IGNORED_FILE) writeFileSync(join(process.cwd(), process.env.BUILD_IGNORED_FILE), "ignored\\n")
@@ -146,6 +157,7 @@ if (command === "version") {
 
 if (command === "publish") {
   if (args.includes("--dry-run")) {
+    pauseAt("dry-run")
     if (process.env.NPM_DRYRUN_FAIL === "1") {
       process.stderr.write("npm error the publish dry-run failed\\n")
       process.exit(1)
@@ -157,6 +169,7 @@ if (command === "publish") {
     if (process.env.DRYRUN_MOVE_RELEASE_TAG) execFileSync(process.env.REAL_GIT, ["update-ref", "refs/tags/v1.0.0", process.env.DRYRUN_MOVE_RELEASE_TAG], {stdio: "inherit"})
     process.exit(0)
   }
+  pauseAt("publish")
   if (process.env.NPM_PUBLISH_FAIL === "1") {
     process.stderr.write("npm error code E500\\nnpm error the publish failed\\n")
     process.exit(1)
@@ -198,6 +211,7 @@ if (command === "view") {
   }
   const registry = readRegistry()
   if (registry.includes(spec)) {
+    pauseAt("verification")
     process.stdout.write(specVersion(spec) + "\\n")
     process.exit(0)
   }
@@ -468,6 +482,21 @@ function withRelease(options, body) {
 }
 
 /**
+ * Async counterpart to `withRelease` for subprocess tests.
+ * @param {ScenarioOptions} options The scenario options.
+ * @param {(context: ScenarioContext) => Promise<void>} body The async test body.
+ */
+async function withReleaseAsync(options, body) {
+  const context = setupRelease(options)
+
+  try {
+    await body(context)
+  } finally {
+    rmSync(context.workspace, {force: true, recursive: true})
+  }
+}
+
+/**
  * Normalizes a failed CLI invocation into the same shape as a successful one.
  * @param {unknown} error The error execFileSync threw.
  * @returns {{failure: Error & {status?: number}, stdout: string, stderr: string, output: string}} The run result.
@@ -481,6 +510,24 @@ function failureResult(error) {
 }
 
 /**
+ * Builds the shared CLI environment for synchronous and signaled subprocess tests.
+ * @param {ScenarioContext} context The scenario context.
+ * @param {Record<string, string>} [extra] Additional environment controls.
+ * @returns {Record<string, string | undefined>} The subprocess environment.
+ */
+function cliEnvironment(context, extra = {}) {
+  return {
+    ...process.env,
+    PATH: `${context.fakeBin}:${process.env.PATH}`,
+    COMMAND_LOG: context.commandLog,
+    REGISTRY_FILE: context.registryFile,
+    NPM_VISIBILITY_STATE_FILE: context.visibilityStateFile,
+    REAL_GIT: context.realGit,
+    ...extra
+  }
+}
+
+/**
  * Runs the release CLI in the scenario's work repo with the fake npm and logging git shim on PATH.
  * @param {ScenarioContext} context The scenario context.
  * @param {{resume?: boolean, args?: string[], env?: Record<string, string>}} [runOptions] The run controls.
@@ -488,15 +535,7 @@ function failureResult(error) {
  */
 function runCli(context, runOptions = {}) {
   const argv = runOptions.args ?? (runOptions.resume ? ["--resume"] : [])
-  const env = {
-    ...process.env,
-    PATH: `${context.fakeBin}:${process.env.PATH}`,
-    COMMAND_LOG: context.commandLog,
-    REGISTRY_FILE: context.registryFile,
-    NPM_VISIBILITY_STATE_FILE: context.visibilityStateFile,
-    REAL_GIT: context.realGit,
-    ...runOptions.env
-  }
+  const env = cliEnvironment(context, runOptions.env)
 
   try {
     const stdout = execFileSync(process.execPath, [releasePatchBin, ...argv], {cwd: context.work, env, encoding: "utf8", stdio: "pipe"})
@@ -504,6 +543,101 @@ function runCli(context, runOptions = {}) {
     return {failure: undefined, stdout, stderr: "", output: stdout}
   } catch (error) {
     return failureResult(error)
+  }
+}
+
+/**
+ * Waits until a lifecycle fixture records that the CLI is blocked inside it.
+ * @param {string} path Marker path.
+ * @returns {Promise<void>} Resolves when the marker exists.
+ */
+function waitForMarker(path) {
+  const deadline = Date.now() + 10_000
+
+  return new Promise((resolvePromise, rejectPromise) => {
+    /** Checks for the marker until the bounded deadline. */
+    function check() {
+      if (existsSync(path)) {
+        resolvePromise()
+      } else if (Date.now() >= deadline) {
+        rejectPromise(new Error(`timed out waiting for lifecycle marker ${path}`))
+      } else {
+        setTimeout(check, 10)
+      }
+    }
+
+    check()
+  })
+}
+
+/**
+ * Collects a spawned CLI's output and exact process termination status.
+ * @param {import("node:child_process").ChildProcessWithoutNullStreams} child Spawned CLI.
+ * @returns {Promise<{code: number | null, signal: string | null, output: string}>} Completion result.
+ */
+function collectChildResult(child) {
+  let output = ""
+
+  child.stdout.on("data", (chunk) => { output += String(chunk) })
+  child.stderr.on("data", (chunk) => { output += String(chunk) })
+
+  return new Promise((resolvePromise, rejectPromise) => {
+    child.once("error", rejectPromise)
+    child.once("close", (code, signal) => resolvePromise({code, signal, output}))
+  })
+}
+
+/**
+ * Delivers the requested signal or fails the test immediately.
+ * @param {import("node:child_process").ChildProcessWithoutNullStreams} child Spawned CLI.
+ * @param {TestTerminationSignal} signal Signal to deliver.
+ */
+function deliverTestSignal(child, signal) {
+  if (!child.kill(signal)) throw new Error(`could not deliver ${signal} to resume process`)
+}
+
+/**
+ * Releases a paused fake lifecycle and stops a child that did not exit as expected.
+ * @param {import("node:child_process").ChildProcessWithoutNullStreams} child Spawned CLI.
+ * @param {string} releasePause Pause-release path.
+ */
+function releasePausedChild(child, releasePause) {
+  if (!existsSync(releasePause)) writeFileSync(releasePause, "continue\n")
+  if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL")
+}
+
+/**
+ * Signals resume while its fake npm child is paused at an exact lifecycle stage, then releases that
+ * child so a deferring parent can finish cleanup and preserve signal termination semantics.
+ * @param {ScenarioContext} context The scenario context.
+ * @param {TestTerminationSignal} signal Signal to deliver directly to the CLI process.
+ * @param {string} stage Fake npm lifecycle stage.
+ * @param {Record<string, string>} [extraEnv] Additional fixture controls.
+ * @returns {Promise<{code: number | null, signal: string | null, output: string}>} CLI result.
+ */
+async function signalResumeAt(context, signal, stage, extraEnv = {}) {
+  const marker = join(context.workspace, `${stage}-paused`)
+  const releasePause = join(context.workspace, `${stage}-continue`)
+  const child = spawn(process.execPath, [releasePatchBin, "--resume"], {
+    cwd: context.work,
+    env: cliEnvironment(context, {
+      ...extraEnv,
+      NPM_PAUSE_AT: stage,
+      NPM_PAUSE_MARKER: marker,
+      NPM_PAUSE_RELEASE: releasePause
+    }),
+    stdio: "pipe"
+  })
+  const completion = collectChildResult(child)
+
+  try {
+    await waitForMarker(marker)
+    deliverTestSignal(child, signal)
+    writeFileSync(releasePause, "continue\n")
+
+    return await completion
+  } finally {
+    releasePausedChild(child, releasePause)
   }
 }
 
@@ -1489,6 +1623,44 @@ function assertCallerCheckoutRestored(context, callerHead) {
   )
 }
 
+/**
+ * Removes one temporary worktree intentionally leaked by the pre-fix process in RED signal tests.
+ * @param {ScenarioContext} context The scenario context.
+ * @param {string} worktree Leaked worktree path.
+ */
+function removeInterruptedResumeWorktree(context, worktree) {
+  git(context.work, ["worktree", "remove", "--force", worktree])
+  const temporaryRoot = dirname(worktree)
+  if (temporaryRoot.startsWith(join(tmpdir(), "release-patch-resume-"))) {
+    rmSync(temporaryRoot, {force: true, recursive: true})
+  }
+}
+
+/**
+ * Restores the fixture caller branch when the pre-fix process left it on master.
+ * @param {ScenarioContext} context The scenario context.
+ */
+function restoreInterruptedResumeCaller(context) {
+  if (git(context.work, ["branch", "--show-current"]).trim() !== "caller") {
+    git(context.work, ["checkout", "caller"])
+  }
+}
+
+/**
+ * Removes state intentionally leaked by the pre-fix process in RED signal tests.
+ * @param {ScenarioContext} context The scenario context.
+ */
+function cleanupInterruptedResumeFixture(context) {
+  const worktrees = git(context.work, ["worktree", "list", "--porcelain"])
+    .split("\n")
+    .filter((line) => line.startsWith("worktree "))
+    .map((line) => line.slice("worktree ".length))
+    .filter((worktree) => worktree !== context.work)
+
+  for (const worktree of worktrees) removeInterruptedResumeWorktree(context, worktree)
+  restoreInterruptedResumeCaller(context)
+}
+
 test("resume publishes the exact tagged tree after master advances and restores the caller checkout", () => {
   withRelease({name: "my-pkg", version: "1.0.0", scripts: {}, packageLock: true, annotatedTags: ["v1.0.0"], published: []}, (context) => {
     const taggedHead = revParse(context.work, "v1.0.0^{commit}")
@@ -1520,6 +1692,31 @@ test("resume restores the caller checkout and removes the tagged worktree after 
     assertCallerCheckoutRestored(context, advancedMaster)
   })
 })
+
+/** @type {{signal: TestTerminationSignal, stage: string, expectedOutput: RegExp | null, extraEnv: Record<string, string>}[]} */
+const resumeSignalScenarios = [
+  {signal: /** @type {TestTerminationSignal} */ ("SIGINT"), stage: "install", expectedOutput: null, extraEnv: {}},
+  {signal: /** @type {TestTerminationSignal} */ ("SIGTERM"), stage: "verification", expectedOutput: null, extraEnv: {}},
+  {signal: /** @type {TestTerminationSignal} */ ("SIGTERM"), stage: "dry-run", expectedOutput: /publish dry-run failed/u, extraEnv: {NPM_DRYRUN_FAIL: "1"}}
+]
+
+for (const scenario of resumeSignalScenarios) {
+  test(`resume defers ${scenario.signal} during ${scenario.stage} until caller and worktree cleanup`, async () => {
+    await withReleaseAsync({name: "my-pkg", version: "1.0.0", scripts: {}, packageLock: true, annotatedTags: ["v1.0.0"], published: []}, async (context) => {
+      const advancedMaster = prepareAdvancedResumeCaller(context)
+      const result = await signalResumeAt(context, scenario.signal, scenario.stage, scenario.extraEnv)
+
+      try {
+        assert.equal(result.code, null, result.output)
+        assert.equal(result.signal, scenario.signal, result.output)
+        if (scenario.expectedOutput !== null) assert.match(result.output, scenario.expectedOutput)
+        assertCallerCheckoutRestored(context, advancedMaster)
+      } finally {
+        cleanupInterruptedResumeFixture(context)
+      }
+    })
+  })
+}
 
 test("resume refuses a clean detached HEAD move after its gates and restores the caller checkout", () => {
   withRelease({name: "my-pkg", version: "1.0.0", scripts: {}, packageLock: true, annotatedTags: ["v1.0.0"], published: []}, (context) => {

@@ -1103,6 +1103,51 @@ function ensureResumePackageName(masterPackageName, taggedPackageName, releaseTa
 }
 
 /** @typedef {{callerDirectory: string, callerCheckout: {branch: string | null, head: string}, temporaryRoot?: string, taggedWorktree?: string}} ResumeContext */
+/** @typedef {"SIGINT" | "SIGTERM"} ResumeTerminationSignal */
+/** @typedef {{pendingSignal?: ResumeTerminationSignal, sigintHandler: () => void, sigtermHandler: () => void}} ResumeSignalDeferral */
+
+/**
+ * Records only the first termination signal so cleanup cannot be interrupted by repeated signals.
+ * @param {ResumeSignalDeferral} deferral Active signal deferral.
+ * @param {ResumeTerminationSignal} signal Delivered signal.
+ */
+function recordResumeTerminationSignal(deferral, signal) {
+  if (deferral.pendingSignal === undefined) deferral.pendingSignal = signal
+}
+
+/**
+ * Defers SIGINT/SIGTERM default termination for the isolated resume transaction. Node can deliver a
+ * signal only after a synchronous child command returns, so handlers remain installed through the
+ * complete cleanup path rather than being removed as soon as release work stops.
+ * @returns {ResumeSignalDeferral} Signal state and exact installed handlers.
+ */
+function deferResumeTerminationSignals() {
+  /** @type {ResumeSignalDeferral} */
+  const deferral = {
+    sigintHandler: () => recordResumeTerminationSignal(deferral, "SIGINT"),
+    sigtermHandler: () => recordResumeTerminationSignal(deferral, "SIGTERM")
+  }
+
+  process.on("SIGINT", deferral.sigintHandler)
+  process.on("SIGTERM", deferral.sigtermHandler)
+
+  return deferral
+}
+
+/**
+ * Restores default signal handling after cleanup, then re-delivers the first deferred signal to self.
+ * Scheduling this on the next event-loop turn lets queued signals reach their handlers after the
+ * synchronous resume stack unwinds and lets unexpected errors reach the top-level diagnostic first.
+ * @param {ResumeSignalDeferral} deferral Completed resume signal deferral.
+ */
+function finishResumeSignalDeferral(deferral) {
+  setImmediate(() => {
+    process.off("SIGINT", deferral.sigintHandler)
+    process.off("SIGTERM", deferral.sigtermHandler)
+
+    if (deferral.pendingSignal !== undefined) process.kill(process.pid, deferral.pendingSignal)
+  })
+}
 
 /**
  * Runs a cleanup action while retaining its failure so every restoration step can still be attempted.
@@ -1226,10 +1271,16 @@ function finishResume(resumeError, cleanupError) {
 function runResumeMode() {
   /** @type {ResumeContext} */
   const context = {callerDirectory: process.cwd(), callerCheckout: captureCallerCheckout()}
-  const resumeError = captureResumeError(() => runIsolatedResume(context))
-  const cleanupError = cleanupResumeWorktree(context)
+  const signalDeferral = deferResumeTerminationSignals()
 
-  finishResume(resumeError, cleanupError)
+  try {
+    const resumeError = captureResumeError(() => runIsolatedResume(context))
+    const cleanupError = cleanupResumeWorktree(context)
+
+    finishResume(resumeError, cleanupError)
+  } finally {
+    finishResumeSignalDeferral(signalDeferral)
+  }
 }
 
 /**
