@@ -1066,11 +1066,12 @@ function addUntaggedPublishedBaseline(context, options) {
  * @param {ScenarioContext} context The scenario context.
  * @param {RegExp} pattern Expected diagnostic.
  * @param {string} gitHead Registry gitHead fixture.
+ * @param {Record<string, string>} [env] Additional fake npm controls.
  */
-function assertReconciliationBlocked(context, pattern, gitHead) {
+function assertReconciliationBlocked(context, pattern, gitHead, env = {}) {
   assertBlocked(context, pattern, {
     args: ["--reconcile-published", "0.5.10", "--expected-git-head", gitHead],
-    env: {NPM_METADATA_VERSION: "0.5.10", NPM_METADATA_GIT_HEAD: gitHead}
+    env: {NPM_METADATA_VERSION: "0.5.10", NPM_METADATA_GIT_HEAD: gitHead, ...env}
   })
 }
 
@@ -1089,6 +1090,66 @@ test("reconciles an exact untagged published baseline and releases the following
     assert.ok(commands.includes(`git tag -a v0.5.10 ${baselineHead} -m v0.5.10`))
     assert.ok(commands.includes("git push origin v0.5.10"))
     assert.ok(commands.indexOf("git push origin v0.5.10") < commands.indexOf("npm version 0.5.11 --no-git-tag-version"))
+  })
+})
+
+test("reconciles consecutive published baselines one at a time before releasing the first unpublished patch", () => {
+  withRelease({
+    name: "docker-quack",
+    version: "0.0.19",
+    scripts: {},
+    packageLock: true,
+    annotatedTags: ["v0.0.19"],
+    published: ["docker-quack@0.0.19"]
+  }, (context) => {
+    /** @type {Record<string, string>} */
+    const publishedHeads = {}
+
+    for (const version of ["0.0.20", "0.0.21", "0.0.22"]) {
+      writeFileSync(join(context.work, "package.json"), JSON.stringify({name: "docker-quack", version, scripts: {}}, null, 2) + "\n")
+      git(context.work, ["add", "package.json"])
+      git(context.work, ["commit", "-m", `release ${version} without tag`])
+      publishedHeads[version] = revParse(context.work, "HEAD")
+    }
+
+    git(context.work, ["push", "origin", "master"])
+    writeFileSync(context.registryFile, JSON.stringify([
+      "docker-quack@0.0.19",
+      "docker-quack@0.0.20",
+      "docker-quack@0.0.21",
+      "docker-quack@0.0.22"
+    ]))
+
+    for (const version of ["0.0.20", "0.0.21"]) {
+      const gitHead = publishedHeads[version]
+      const commands = release(context, {
+        args: ["--reconcile-published", version, "--expected-git-head", gitHead],
+        env: {NPM_METADATA_VERSION: version, NPM_METADATA_GIT_HEAD: gitHead}
+      })
+
+      assert.equal(git(context.origin, ["cat-file", "-t", `v${version}`]).trim(), "tag")
+      assert.equal(revParse(context.origin, `v${version}^{commit}`), gitHead)
+      assert.deepEqual(commands.filter((command) => command.startsWith("git push")), [`git push origin v${version}`])
+      assert.equal(ranCommand(commands, "npm install"), false, "a historical-gap step must not install")
+      assert.equal(ranCommand(commands, "npm version "), false, "a historical-gap step must not bump")
+      assert.equal(ranCommand(commands, "git commit"), false, "a historical-gap step must not commit")
+      assert.equal(commands.includes("npm publish --dry-run"), false, "a historical-gap step must not dry-run")
+      assert.equal(commands.includes("npm publish"), false, "a historical-gap step must not publish")
+      clearCommands(context)
+    }
+
+    const finalVersion = "0.0.22"
+    const finalHead = publishedHeads[finalVersion]
+    const commands = release(context, {
+      args: ["--reconcile-published", finalVersion, "--expected-git-head", finalHead],
+      env: {NPM_METADATA_VERSION: finalVersion, NPM_METADATA_GIT_HEAD: finalHead}
+    })
+
+    assert.equal(revParse(context.origin, "v0.0.22^{commit}"), finalHead)
+    assert.ok(commands.includes("git push origin v0.0.22"))
+    assert.ok(commands.includes("npm version 0.0.23 --no-git-tag-version"))
+    assert.ok(commands.includes("git push --atomic origin master v0.0.23"))
+    assert.ok(registryOf(context).includes("docker-quack@0.0.23"))
   })
 })
 
@@ -1115,10 +1176,7 @@ test("reconciliation rejects an unpublished preceding annotated tag", () => {
 test("reconciliation fails closed before tagging when registry provenance is incomplete", () => {
   withRelease({name: "my-pkg", version: "0.5.9", scripts: {}, packageLock: true, annotatedTags: ["v0.5.9"]}, (context) => {
     const baselineHead = addUntaggedPublishedBaseline(context)
-    assertBlocked(context, /registry metadata.*gitHead/u, {
-      args: ["--reconcile-published", "0.5.10", "--expected-git-head", baselineHead],
-      env: {NPM_METADATA_VERSION: "0.5.10", NPM_METADATA_GIT_HEAD: ""}
-    })
+    assertReconciliationBlocked(context, /registry metadata.*gitHead/u, baselineHead, {NPM_METADATA_GIT_HEAD: ""})
   })
 })
 
@@ -1166,12 +1224,15 @@ test("reconciliation refuses an existing tag instead of moving or replacing it",
   })
 })
 
-test("reconciliation preserves duplicate protection before creating the baseline tag", () => {
+test("reconciliation fails closed before creating the baseline tag when the following-patch lookup is ambiguous", () => {
   withRelease({name: "my-pkg", version: "0.5.9", scripts: {}, packageLock: true, annotatedTags: ["v0.5.9"]}, (context) => {
     const baselineHead = addUntaggedPublishedBaseline(context)
-    writeFileSync(context.registryFile, JSON.stringify(["my-pkg@0.5.9", "my-pkg@0.5.10", "my-pkg@0.5.11"]))
 
-    assertReconciliationBlocked(context, /my-pkg@0\.5\.11 is already published/u, baselineHead)
+    assertReconciliationBlocked(context, /could not determine whether my-pkg@0\.5\.11 is already published/u, baselineHead, {
+      NPM_VIEW_ERROR_VERSION: "0.5.11",
+      NPM_VIEW_ERROR_STDERR: "npm error code EAI_AGAIN\nnpm error network registry lookup failed",
+      NPM_VIEW_ERROR_EXIT: "1"
+    })
     assert.equal(git(context.work, ["tag", "-l", "v0.5.10"]).trim(), "")
   })
 })
