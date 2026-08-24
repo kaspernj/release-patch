@@ -73,7 +73,8 @@ function parseCliArgs(argv) {
 
   throw new Error(
     `release-patch: unknown argument ${JSON.stringify(args[0])}. Supported modes are --resume and ` +
-    "--reconcile-published X.Y.Z --expected-git-head <SHA>; run without flags for a normal patch release."
+    "--reconcile-published X.Y.Z --expected-git-head <SHA>; run without flags for a normal patch release. " +
+    "Reconcile consecutive published gaps by invoking each version separately with its own reviewed SHA."
   )
 }
 
@@ -799,8 +800,9 @@ function createOrVerifyBaselineTag(releaseTag, gitHead) {
 }
 
 /**
- * Reconciles one explicitly named npm-published baseline that is missing its release tag, then uses
- * the unchanged normal release path to cut the following patch from that authenticated baseline.
+ * Reconciles one explicitly named npm-published baseline that is missing its release tag. When the
+ * following patch is already published, this records only the authenticated historical baseline;
+ * otherwise it uses the unchanged normal release path to cut the first unpublished following patch.
  * @param {{name: string, version?: string, scripts?: Record<string, string>}} packageJson The current validated manifest.
  * @param {string} packageName The current validated package name.
  * @param {string} version The exact already-published baseline version.
@@ -816,9 +818,11 @@ function runReconciledRelease(packageJson, packageName, version, expectedGitHead
   ensureExpectedGitHead(gitHead, expectedGitHead, packageName, version)
   ensureRegistryCommitIdentity(gitHead, packageName, version)
 
-  // Prove the following patch is available before recording even the baseline tag. The unchanged
-  // normal release repeats this duplicate preflight immediately before its own mutations.
-  ensureVersionAvailable(packageName, deriveNextPatchVersion(requestedVersion))
+  // Classify the following patch before recording even the baseline tag. An ambiguous lookup throws
+  // here and fails closed; a published patch makes this a tag-only historical-gap step, while an
+  // unambiguous E404 permits the unchanged normal release path after the baseline is recorded.
+  const followingVersion = deriveNextPatchVersion(requestedVersion)
+  const followingPatchIsPublished = lookupPublishedVersion(`${packageName}@${followingVersion}`).trim() !== ""
 
   const releaseTag = `v${version}`
   createOrVerifyBaselineTag(releaseTag, gitHead)
@@ -826,6 +830,15 @@ function runReconciledRelease(packageJson, packageName, version, expectedGitHead
   // Publish the authenticated immutable baseline tag by itself. If this non-force push fails, the
   // local exact tag remains for inspection and an idempotent retry; no version commit exists yet.
   runArgs("git", ["push", "origin", releaseTag])
+  if (followingPatchIsPublished) {
+    console.log(
+      `release-patch: reconciled published historical baseline ${releaseTag}; ${packageName}@${followingVersion} is ` +
+      "also published, so no release was created. Reconcile that next baseline separately with its own " +
+      "operator-reviewed --expected-git-head."
+    )
+    return
+  }
+
   runNormalRelease(packageJson, packageName, {tag: releaseTag, version: /** @type {{major: number, minor: number, patch: number}} */ (parseReleaseTag(releaseTag))})
 }
 
