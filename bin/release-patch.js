@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import {execFileSync, execSync} from "node:child_process"
-import {existsSync, readFileSync} from "node:fs"
-import {resolve} from "node:path"
+import {existsSync, mkdtempSync, readFileSync, rmSync} from "node:fs"
+import {tmpdir} from "node:os"
+import {join, resolve} from "node:path"
 import validateNpmPackageName from "validate-npm-package-name"
 
 // `preversion` runs before the version bump, and publish hooks run after the push.
@@ -554,23 +555,6 @@ function ensureNoStrayReleaseChanges() {
 }
 
 /**
- * Pushes the exact release commit and its annotated tag to origin atomically, then publishes and
- * verifies. The push never forces and is a no-op when origin already has both refs. If the real
- * publish fails after the push, the commit and tag are already public, so the error explains how to
- * finish with `release-patch --resume` and the non-zero exit is preserved.
- * @param {string} packageName The validated package name.
- * @param {string} version The exact version being released.
- * @param {string} releaseTag The annotated release tag (`v<version>`).
- */
-function pushPublishAndVerify(packageName, version, releaseTag) {
-  // Push the release commit and its exact tag together atomically, never forcing, so master is
-  // never published without the matching release tag if the tag push would fail on its own.
-  run(`git push --atomic origin master ${releaseTag}`)
-
-  publishAndVerify(packageName, version, releaseTag)
-}
-
-/**
  * Publishes after the release refs are public, preserving resume recovery on any registry failure.
  * @param {string} packageName The validated package name.
  * @param {string} version The exact version being released.
@@ -1030,14 +1014,283 @@ function errorMessage(error) {
 }
 
 /**
- * Resumes a tagged-but-unpublished release. It publishes the exact existing latest annotated tag —
- * only when that tag points at the current synced master HEAD and package.json's version matches it
- * exactly — without bumping, committing or creating another tag. Already-published tags make resume a
- * verified no-op; otherwise the dependency, build and dry-run gates run, the exact master/tag is
- * pushed atomically (a no-op when already on origin), and the exact version is published and verified.
+ * Captures the exact caller checkout so resume can temporarily sync master and always return to the
+ * original branch (or detached commit) without involving the caller's files in publish lifecycle work.
+ * @returns {{branch: string | null, head: string}} The caller checkout identity.
+ */
+function captureCallerCheckout() {
+  const head = runCaptureArgs("git", ["rev-parse", "--verify", "HEAD"]).trim()
+
+  try {
+    const branch = execFileSync("git", ["symbolic-ref", "--quiet", "--short", "HEAD"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"]
+    }).trim()
+
+    return {branch, head}
+  } catch {
+    return {branch: null, head}
+  }
+}
+
+/**
+ * Restores the caller's original branch or detached commit after resume work finishes.
+ * @param {{branch: string | null, head: string}} callerCheckout The captured caller checkout.
+ */
+function restoreCallerCheckout(callerCheckout) {
+  if (callerCheckout.branch === null) {
+    runArgs("git", ["checkout", "--detach", callerCheckout.head])
+  } else {
+    runArgs("git", ["checkout", callerCheckout.branch])
+  }
+}
+
+/**
+ * Resolves the annotated tag object once, derives its commit from that immutable object, and requires
+ * the commit to belong to the exact synced master history that resume will push.
+ * @param {{tag: string, version: {major: number, minor: number, patch: number}} | null} latest Latest annotated tag.
+ * @param {string} masterCommit Exact synced master commit SHA.
+ * @returns {{tagCommit: string, tagObject: string}} The immutable annotated tag object and its commit.
+ */
+function resumeTagObjectsOnCurrentMaster(latest, masterCommit) {
+  if (latest === null) {
+    throw new Error(
+      "release-patch: --resume needs an existing annotated vX.Y.Z release tag to publish, but none was found. " +
+      "Create one matching package.json and HEAD first (for example: git tag -a v0.0.0 -m v0.0.0)."
+    )
+  }
+
+  const tagObject = runCaptureArgs("git", ["rev-parse", "--verify", `refs/tags/${latest.tag}^{tag}`]).trim()
+  const tagCommit = runCaptureArgs("git", ["rev-parse", "--verify", `${tagObject}^{commit}`]).trim()
+  if (!gitSucceeds(["merge-base", "--is-ancestor", tagCommit, masterCommit])) {
+    throw new Error(
+      `release-patch: --resume cannot publish ${latest.tag} because its commit ${tagCommit} is not an ancestor of ` +
+      "current master; refusing to publish a release outside authoritative master history."
+    )
+  }
+
+  return {tagCommit, tagObject}
+}
+
+/**
+ * Preserves the existing master-manifest trust boundary before switching to the exact tagged tree.
+ * @param {{name: string, version?: string}} masterPackageJson Validated synced-master manifest.
+ * @param {{tag: string, version: {major: number, minor: number, patch: number}}} latest Latest annotated tag.
+ */
+function ensureResumeMasterMetadata(masterPackageJson, latest) {
+  const version = versionString(latest.version)
+  if (masterPackageJson.version !== version) {
+    throw new Error(
+      `release-patch: --resume requires current master package.json version (${masterPackageJson.version ?? "unset"}) ` +
+      `to exactly match the tag ${latest.tag}; refusing to recover a different release identity.`
+    )
+  }
+}
+
+/**
+ * Requires the tagged manifest to retain the package identity validated on synced master.
+ * @param {string} masterPackageName Package name from synced master.
+ * @param {string} taggedPackageName Package name from the exact tagged tree.
+ * @param {string} releaseTag Resume tag.
+ */
+function ensureResumePackageName(masterPackageName, taggedPackageName, releaseTag) {
+  if (taggedPackageName !== masterPackageName) {
+    throw new Error(
+      `release-patch: package.json at ${releaseTag} declares name ${taggedPackageName}, not current master package ` +
+      `${masterPackageName}; refusing to publish a different package identity.`
+    )
+  }
+}
+
+/** @typedef {{callerDirectory: string, callerCheckout: {branch: string | null, head: string}, temporaryRoot?: string, taggedWorktree?: string}} ResumeContext */
+/** @typedef {"SIGINT" | "SIGTERM"} ResumeTerminationSignal */
+/** @typedef {{pendingSignal?: ResumeTerminationSignal, sigintHandler: () => void, sigtermHandler: () => void}} ResumeSignalDeferral */
+
+/**
+ * Records only the first termination signal so cleanup cannot be interrupted by repeated signals.
+ * @param {ResumeSignalDeferral} deferral Active signal deferral.
+ * @param {ResumeTerminationSignal} signal Delivered signal.
+ */
+function recordResumeTerminationSignal(deferral, signal) {
+  if (deferral.pendingSignal === undefined) deferral.pendingSignal = signal
+}
+
+/**
+ * Defers SIGINT/SIGTERM default termination for the isolated resume transaction. Node can deliver a
+ * signal only after a synchronous child command returns, so handlers remain installed through the
+ * complete cleanup path rather than being removed as soon as release work stops.
+ * @returns {ResumeSignalDeferral} Signal state and exact installed handlers.
+ */
+function deferResumeTerminationSignals() {
+  /** @type {ResumeSignalDeferral} */
+  const deferral = {
+    sigintHandler: () => recordResumeTerminationSignal(deferral, "SIGINT"),
+    sigtermHandler: () => recordResumeTerminationSignal(deferral, "SIGTERM")
+  }
+
+  process.on("SIGINT", deferral.sigintHandler)
+  process.on("SIGTERM", deferral.sigtermHandler)
+
+  return deferral
+}
+
+/**
+ * Restores default signal handling after cleanup, then re-delivers the first deferred signal to self.
+ * Scheduling this on the next event-loop turn lets queued signals reach their handlers after the
+ * synchronous resume stack unwinds and lets unexpected errors reach the top-level diagnostic first.
+ * @param {ResumeSignalDeferral} deferral Completed resume signal deferral.
+ */
+function finishResumeSignalDeferral(deferral) {
+  setImmediate(() => {
+    process.off("SIGINT", deferral.sigintHandler)
+    process.off("SIGTERM", deferral.sigtermHandler)
+
+    if (deferral.pendingSignal !== undefined) process.kill(process.pid, deferral.pendingSignal)
+  })
+}
+
+/**
+ * Runs a cleanup action while retaining its failure so every restoration step can still be attempted.
+ * @param {() => void} action Cleanup action.
+ * @param {unknown[]} failures Collected cleanup failures.
+ */
+function attemptResumeCleanup(action, failures) {
+  try {
+    action()
+  } catch (error) {
+    failures.push(error)
+  }
+}
+
+/**
+ * Removes the registered tagged worktree when resume created one.
+ * @param {ResumeContext} context Resume paths and caller identity.
+ * @param {unknown[]} failures Collected cleanup failures.
+ */
+function removeTaggedWorktree(context, failures) {
+  if (context.taggedWorktree === undefined) return
+  attemptResumeCleanup(() => runArgs("git", ["worktree", "remove", "--force", /** @type {string} */ (context.taggedWorktree)]), failures)
+}
+
+/**
+ * Removes only the temporary directory owned by this resume attempt.
+ * @param {ResumeContext} context Resume paths and caller identity.
+ * @param {unknown[]} failures Collected cleanup failures.
+ */
+function removeResumeTemporaryRoot(context, failures) {
+  if (context.temporaryRoot === undefined) return
+  attemptResumeCleanup(() => rmSync(/** @type {string} */ (context.temporaryRoot), {force: true, recursive: true}), failures)
+}
+
+/**
+ * Removes the isolated tagged worktree and restores the caller checkout, attempting every cleanup
+ * step even when an earlier one fails.
+ * @param {ResumeContext} context Resume paths and caller identity.
+ * @returns {Error | undefined} Aggregated cleanup failure, if any.
+ */
+function cleanupResumeWorktree(context) {
+  /** @type {unknown[]} */
+  const failures = []
+
+  attemptResumeCleanup(() => process.chdir(context.callerDirectory), failures)
+  removeTaggedWorktree(context, failures)
+  removeResumeTemporaryRoot(context, failures)
+  attemptResumeCleanup(() => restoreCallerCheckout(context.callerCheckout), failures)
+
+  return failures.length === 0 ? undefined : new AggregateError(
+    failures,
+    "release-patch: could not fully remove the resume worktree and restore the caller checkout."
+  )
+}
+
+/**
+ * Runs an action and returns its failure instead of throwing so cleanup can run first.
+ * @param {() => void} action Resume action.
+ * @returns {unknown | undefined} The action failure.
+ */
+function captureResumeError(action) {
+  try {
+    action()
+    return undefined
+  } catch (error) {
+    return error
+  }
+}
+
+/**
+ * Syncs and validates master, then runs the existing resume transaction inside the exact tag.
+ * @param {ResumeContext} context Mutable resume paths and caller identity.
+ */
+function runIsolatedResume(context) {
+  ensureLatestMaster()
+  const masterCommit = runCaptureArgs("git", ["rev-parse", "--verify", "HEAD"]).trim()
+  const masterPackageJson = readValidatedPackageJson()
+  ensureNpmAuth()
+  fetchTags()
+
+  const latest = latestAnnotatedReleaseTag()
+  const {tagCommit, tagObject} = resumeTagObjectsOnCurrentMaster(latest, masterCommit)
+  const release = {
+    .../** @type {{tag: string, version: {major: number, minor: number, patch: number}}} */ (latest),
+    masterCommit,
+    tagCommit,
+    tagObject
+  }
+  ensureResumeMasterMetadata(masterPackageJson, release)
+
+  context.temporaryRoot = mkdtempSync(join(tmpdir(), "release-patch-resume-"))
+  const worktreePath = join(context.temporaryRoot, "tagged")
+  runArgs("git", ["worktree", "add", "--detach", worktreePath, tagCommit])
+  context.taggedWorktree = worktreePath
+  process.chdir(worktreePath)
+
+  const taggedPackageJson = readValidatedPackageJson()
+  ensureResumePackageName(masterPackageJson.name, taggedPackageJson.name, release.tag)
+  runResume(taggedPackageJson, taggedPackageJson.name, release)
+}
+
+/**
+ * Surfaces cleanup failures without losing the original resume diagnostic.
+ * @param {unknown | undefined} resumeError Original resume failure.
+ * @param {Error | undefined} cleanupError Cleanup failure.
+ */
+function finishResume(resumeError, cleanupError) {
+  if (cleanupError !== undefined) {
+    throw new Error(
+      `release-patch: resume cleanup failed after ${resumeError === undefined ? "the release completed" : `the release failed: ${errorMessage(resumeError)}`}.`,
+      {cause: cleanupError}
+    )
+  }
+  if (resumeError !== undefined) throw resumeError
+}
+
+/**
+ * Runs resume from an isolated detached worktree at the exact release tag, then restores the caller
+ * checkout on both success and failure. Master remains the ref pushed atomically with the tag.
+ */
+function runResumeMode() {
+  /** @type {ResumeContext} */
+  const context = {callerDirectory: process.cwd(), callerCheckout: captureCallerCheckout()}
+  const signalDeferral = deferResumeTerminationSignals()
+
+  try {
+    const resumeError = captureResumeError(() => runIsolatedResume(context))
+    const cleanupError = cleanupResumeWorktree(context)
+
+    finishResume(resumeError, cleanupError)
+  } finally {
+    finishResumeSignalDeferral(signalDeferral)
+  }
+}
+
+/**
+ * Resumes a tagged-but-unpublished release from an isolated worktree whose HEAD is the exact existing
+ * annotated tag and whose package.json version matches it. It never bumps, commits or tags.
+ * Already-published tags make resume a verified no-op; otherwise the dependency, build and dry-run
+ * gates run, master/tag are pushed atomically, and the exact tagged version is published and verified.
  * @param {{version?: string, scripts?: Record<string, string>}} packageJson The validated manifest.
  * @param {string} packageName The validated package name.
- * @param {{tag: string, version: {major: number, minor: number, patch: number}} | null} latest The latest annotated release tag.
+ * @param {{tag: string, version: {major: number, minor: number, patch: number}, masterCommit: string, tagCommit: string, tagObject: string} | null} latest The validated immutable resume objects.
  */
 function runResume(packageJson, packageName, latest) {
   if (latest === null) {
@@ -1050,12 +1303,13 @@ function runResume(packageJson, packageName, latest) {
   const version = versionString(latest.version)
   const releaseTag = latest.tag
 
-  ensureResumeMatchesTaggedCommit(packageJson, releaseTag, version)
+  ensureResumeMatchesTaggedCommit(packageJson, releaseTag, version, latest.tagCommit)
 
   // If the exact version is already on npm, resume is a verified no-op: make sure origin has the
   // refs (a no-op when already pushed) and confirm the published version, without republishing.
   if (lookupPublishedVersion(`${packageName}@${version}`).trim() !== "") {
-    run(`git push --atomic origin master ${releaseTag}`)
+    ensureResumeTreeMatchesTag(releaseTag, latest.tagCommit)
+    pushExactResumeRefs(latest)
     verifyPublished(packageName, version)
 
     return
@@ -1068,20 +1322,28 @@ function runResume(packageJson, packageName, latest) {
   // Install, build and the dry-run can regenerate a lockfile or emit tracked/non-ignored files. Before
   // pushing or publishing, require the tree to still exactly match the tagged commit so resume can
   // never ship a tree the tag does not record.
-  ensureResumeTreeMatchesTag(releaseTag)
+  ensureResumeTreeMatchesTag(releaseTag, latest.tagCommit)
 
-  pushPublishAndVerify(packageName, version, releaseTag)
+  pushExactResumeRefs(latest)
+  ensureResumeTreeMatchesTag(releaseTag, latest.tagCommit)
+  publishAndVerify(packageName, version, releaseTag)
 }
 
 /**
- * After resume's install, build and publish dry-run, refuses to push or publish unless the entire
- * non-ignored working tree still exactly matches the tagged commit. `ensureResumeMatchesTaggedCommit`
- * has already proven HEAD is the tagged commit, so an empty `git status --porcelain` means the tree
- * matches the tag; any tracked change or non-ignored untracked file means install, build or the
- * dry-run drifted the tree away from the tag and the release must not proceed.
- * @param {string} releaseTag The tag being resumed (`v<version>`), which HEAD is pinned to.
+ * Refuses to push or publish unless both HEAD and the non-ignored working tree still match the exact
+ * tagged commit validated before lifecycle gates ran.
+ * @param {string} releaseTag The tag being resumed (`v<version>`).
+ * @param {string} tagCommit The immutable tagged commit validated for this resume.
  */
-function ensureResumeTreeMatchesTag(releaseTag) {
+function ensureResumeTreeMatchesTag(releaseTag, tagCommit) {
+  const headCommit = runCaptureArgs("git", ["rev-parse", "--verify", "HEAD"]).trim()
+  if (headCommit !== tagCommit) {
+    throw new Error(
+      `release-patch: resume worktree HEAD is ${headCommit}, not the exact validated commit ${tagCommit} tagged ` +
+      `${releaseTag}; refusing to push or publish after the detached worktree moved.`
+    )
+  }
+
   const status = runCapture("git status --porcelain")
 
   if (status.trim() !== "") {
@@ -1095,21 +1357,36 @@ function ensureResumeTreeMatchesTag(releaseTag) {
 }
 
 /**
- * Refuses a resume unless the tag it would publish is on the current master HEAD and the synced
- * package.json version matches it exactly, so resume can never publish a tree the tag does not record.
+ * Atomically and non-force pushes the exact validated objects to their intended remote refs. Object
+ * IDs as refspec sources prevent concurrent local master or tag movement from changing what is sent;
+ * ordinary non-force receive checks still reject a conflicting remote branch or tag update.
+ * @param {{tag: string, masterCommit: string, tagObject: string}} release Validated immutable refs.
+ */
+function pushExactResumeRefs(release) {
+  runArgs("git", [
+    "push",
+    "--atomic",
+    "origin",
+    `${release.masterCommit}:refs/heads/master`,
+    `${release.tagObject}:refs/tags/${release.tag}`
+  ])
+}
+
+/**
+ * Refuses a resume unless the isolated worktree HEAD and its package.json match the exact tag, so
+ * resume can never publish a tree the tag does not record.
  * @param {{version?: string}} packageJson The validated manifest.
  * @param {string} releaseTag The tag to resume (`v<version>`).
  * @param {string} version The exact version the tag names.
+ * @param {string} tagCommit The immutable tag commit validated before creating the worktree.
  */
-function ensureResumeMatchesTaggedCommit(packageJson, releaseTag, version) {
-  const tagCommit = runCapture(`git rev-parse --verify ${releaseTag}^{commit}`).trim()
-  const headCommit = runCapture("git rev-parse --verify HEAD").trim()
+function ensureResumeMatchesTaggedCommit(packageJson, releaseTag, version, tagCommit) {
+  const headCommit = runCaptureArgs("git", ["rev-parse", "--verify", "HEAD"]).trim()
 
   if (tagCommit !== headCommit) {
     throw new Error(
-      `release-patch: --resume can only publish ${releaseTag} when it points at the current master HEAD, but ` +
-      `${releaseTag} is on ${tagCommit} while HEAD is ${headCommit}. Check out and sync the exact tagged commit, ` +
-      "or run a normal release instead."
+      `release-patch: --resume isolated ${releaseTag} at ${tagCommit}, but its worktree HEAD is ${headCommit}; ` +
+      "refusing to publish a tree that is not the exact tagged commit."
     )
   }
 
@@ -1129,6 +1406,11 @@ function main() {
   // the release commit and `git checkout master` can never clobber uncommitted work.
   ensureCleanWorkingTree()
 
+  if (resume) {
+    runResumeMode()
+    return
+  }
+
   // Sync to the authoritative master before reading anything to publish, so the manifest we validate
   // and release is the fast-forwarded master, never stale feature-branch metadata carried across the sync.
   ensureLatestMaster()
@@ -1139,22 +1421,15 @@ function main() {
 
   ensureNpmAuth()
 
-  // Git tags are the source of truth. A normal release derives the next version from origin's
-  // authoritative tag set, so it prunes local-only or stale tags and force-updates changed ones
-  // before reading the latest tag; resume may publish a not-yet-pushed bootstrap tag, so it fetches
-  // origin's tags without pruning the local ones.
-  if (resume) {
-    fetchTags()
-    runResume(packageJson, packageName, latestAnnotatedReleaseTag())
-  } else {
-    fetchOriginAuthoritativeTags()
-    const latest = latestAnnotatedReleaseTag()
+  // Git tags are the source of truth. Normal and reconciliation releases derive from origin's
+  // authoritative tag set, pruning local-only or stale tags and force-updating changed ones first.
+  fetchOriginAuthoritativeTags()
+  const latest = latestAnnotatedReleaseTag()
 
-    if (reconcilePublished !== undefined) {
-      runReconciledRelease(packageJson, packageName, reconcilePublished, /** @type {string} */ (expectedGitHead), latest)
-    } else {
-      runNormalRelease(packageJson, packageName, latest)
-    }
+  if (reconcilePublished !== undefined) {
+    runReconciledRelease(packageJson, packageName, reconcilePublished, /** @type {string} */ (expectedGitHead), latest)
+  } else {
+    runNormalRelease(packageJson, packageName, latest)
   }
 }
 

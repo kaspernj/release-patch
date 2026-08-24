@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import {execFileSync} from "node:child_process"
+import {execFileSync, spawn} from "node:child_process"
 import {chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync} from "node:fs"
 import {tmpdir} from "node:os"
 import {dirname, join, resolve} from "node:path"
@@ -13,6 +13,8 @@ const projectPackageJson = JSON.parse(readFileSync(join(projectRoot, "package.js
 
 // The version manifests npm's bump touches and that the release commit is expected to carry.
 const versionManifestFiles = ["package.json", "package-lock.json", "npm-shrinkwrap.json"]
+
+/** @typedef {"SIGINT" | "SIGTERM"} TestTerminationSignal */
 
 /**
  * @typedef {object} ScenarioOptions
@@ -85,6 +87,7 @@ function writeExecutable(path, contents) {
  */
 function fakeNpmScript() {
   return `#!/usr/bin/env node
+import {execFileSync} from "node:child_process"
 import {appendFileSync, existsSync, readFileSync, writeFileSync} from "node:fs"
 import {join} from "node:path"
 
@@ -104,6 +107,13 @@ function specVersion(spec) {
   return spec.slice(spec.lastIndexOf("@") + 1)
 }
 
+function pauseAt(stage) {
+  if (process.env.NPM_PAUSE_AT !== stage) return
+  writeFileSync(process.env.NPM_PAUSE_MARKER, stage)
+  const wait = new Int32Array(new SharedArrayBuffer(4))
+  while (!existsSync(process.env.NPM_PAUSE_RELEASE)) Atomics.wait(wait, 0, 0, 10)
+}
+
 const command = args[0]
 
 if (command === "whoami") {
@@ -115,6 +125,7 @@ if (command === "login") {
 }
 
 if (command === "install") {
+  pauseAt("install")
   if (process.env.INSTALL_STRAY_FILE) writeFileSync(join(process.cwd(), process.env.INSTALL_STRAY_FILE), "stray\\n")
   if (process.env.INSTALL_TRACKED_FILE) writeFileSync(join(process.cwd(), process.env.INSTALL_TRACKED_FILE), "mutated by install\\n")
   if (process.env.INSTALL_LOCKFILE) writeFileSync(join(process.cwd(), "package-lock.json"), JSON.stringify({name: "generated", version: "0.0.0"}) + "\\n")
@@ -122,6 +133,7 @@ if (command === "install") {
 }
 
 if (command === "run" && args[1] === "build") {
+  pauseAt("build")
   if (process.env.BUILD_FAIL === "1") process.exit(1)
   if (process.env.BUILD_STRAY_FILE) writeFileSync(join(process.cwd(), process.env.BUILD_STRAY_FILE), "stray\\n")
   if (process.env.BUILD_IGNORED_FILE) writeFileSync(join(process.cwd(), process.env.BUILD_IGNORED_FILE), "ignored\\n")
@@ -145,14 +157,19 @@ if (command === "version") {
 
 if (command === "publish") {
   if (args.includes("--dry-run")) {
+    pauseAt("dry-run")
     if (process.env.NPM_DRYRUN_FAIL === "1") {
       process.stderr.write("npm error the publish dry-run failed\\n")
       process.exit(1)
     }
     if (process.env.DRYRUN_STRAY_FILE) writeFileSync(join(process.cwd(), process.env.DRYRUN_STRAY_FILE), "stray\\n")
     if (process.env.DRYRUN_TRACKED_FILE) writeFileSync(join(process.cwd(), process.env.DRYRUN_TRACKED_FILE), "mutated by dry-run\\n")
+    if (process.env.DRYRUN_MOVE_HEAD) execFileSync(process.env.REAL_GIT, ["checkout", "--detach", process.env.DRYRUN_MOVE_HEAD], {stdio: "inherit"})
+    if (process.env.DRYRUN_MOVE_MASTER) execFileSync(process.env.REAL_GIT, ["update-ref", "refs/heads/master", process.env.DRYRUN_MOVE_MASTER], {stdio: "inherit"})
+    if (process.env.DRYRUN_MOVE_RELEASE_TAG) execFileSync(process.env.REAL_GIT, ["update-ref", "refs/tags/v1.0.0", process.env.DRYRUN_MOVE_RELEASE_TAG], {stdio: "inherit"})
     process.exit(0)
   }
+  pauseAt("publish")
   if (process.env.NPM_PUBLISH_FAIL === "1") {
     process.stderr.write("npm error code E500\\nnpm error the publish failed\\n")
     process.exit(1)
@@ -194,6 +211,7 @@ if (command === "view") {
   }
   const registry = readRegistry()
   if (registry.includes(spec)) {
+    pauseAt("verification")
     process.stdout.write(specVersion(spec) + "\\n")
     process.exit(0)
   }
@@ -464,6 +482,21 @@ function withRelease(options, body) {
 }
 
 /**
+ * Async counterpart to `withRelease` for subprocess tests.
+ * @param {ScenarioOptions} options The scenario options.
+ * @param {(context: ScenarioContext) => Promise<void>} body The async test body.
+ */
+async function withReleaseAsync(options, body) {
+  const context = setupRelease(options)
+
+  try {
+    await body(context)
+  } finally {
+    rmSync(context.workspace, {force: true, recursive: true})
+  }
+}
+
+/**
  * Normalizes a failed CLI invocation into the same shape as a successful one.
  * @param {unknown} error The error execFileSync threw.
  * @returns {{failure: Error & {status?: number}, stdout: string, stderr: string, output: string}} The run result.
@@ -477,6 +510,24 @@ function failureResult(error) {
 }
 
 /**
+ * Builds the shared CLI environment for synchronous and signaled subprocess tests.
+ * @param {ScenarioContext} context The scenario context.
+ * @param {Record<string, string>} [extra] Additional environment controls.
+ * @returns {Record<string, string | undefined>} The subprocess environment.
+ */
+function cliEnvironment(context, extra = {}) {
+  return {
+    ...process.env,
+    PATH: `${context.fakeBin}:${process.env.PATH}`,
+    COMMAND_LOG: context.commandLog,
+    REGISTRY_FILE: context.registryFile,
+    NPM_VISIBILITY_STATE_FILE: context.visibilityStateFile,
+    REAL_GIT: context.realGit,
+    ...extra
+  }
+}
+
+/**
  * Runs the release CLI in the scenario's work repo with the fake npm and logging git shim on PATH.
  * @param {ScenarioContext} context The scenario context.
  * @param {{resume?: boolean, args?: string[], env?: Record<string, string>}} [runOptions] The run controls.
@@ -484,15 +535,7 @@ function failureResult(error) {
  */
 function runCli(context, runOptions = {}) {
   const argv = runOptions.args ?? (runOptions.resume ? ["--resume"] : [])
-  const env = {
-    ...process.env,
-    PATH: `${context.fakeBin}:${process.env.PATH}`,
-    COMMAND_LOG: context.commandLog,
-    REGISTRY_FILE: context.registryFile,
-    NPM_VISIBILITY_STATE_FILE: context.visibilityStateFile,
-    REAL_GIT: context.realGit,
-    ...runOptions.env
-  }
+  const env = cliEnvironment(context, runOptions.env)
 
   try {
     const stdout = execFileSync(process.execPath, [releasePatchBin, ...argv], {cwd: context.work, env, encoding: "utf8", stdio: "pipe"})
@@ -500,6 +543,101 @@ function runCli(context, runOptions = {}) {
     return {failure: undefined, stdout, stderr: "", output: stdout}
   } catch (error) {
     return failureResult(error)
+  }
+}
+
+/**
+ * Waits until a lifecycle fixture records that the CLI is blocked inside it.
+ * @param {string} path Marker path.
+ * @returns {Promise<void>} Resolves when the marker exists.
+ */
+function waitForMarker(path) {
+  const deadline = Date.now() + 10_000
+
+  return new Promise((resolvePromise, rejectPromise) => {
+    /** Checks for the marker until the bounded deadline. */
+    function check() {
+      if (existsSync(path)) {
+        resolvePromise()
+      } else if (Date.now() >= deadline) {
+        rejectPromise(new Error(`timed out waiting for lifecycle marker ${path}`))
+      } else {
+        setTimeout(check, 10)
+      }
+    }
+
+    check()
+  })
+}
+
+/**
+ * Collects a spawned CLI's output and exact process termination status.
+ * @param {import("node:child_process").ChildProcessWithoutNullStreams} child Spawned CLI.
+ * @returns {Promise<{code: number | null, signal: string | null, output: string}>} Completion result.
+ */
+function collectChildResult(child) {
+  let output = ""
+
+  child.stdout.on("data", (chunk) => { output += String(chunk) })
+  child.stderr.on("data", (chunk) => { output += String(chunk) })
+
+  return new Promise((resolvePromise, rejectPromise) => {
+    child.once("error", rejectPromise)
+    child.once("close", (code, signal) => resolvePromise({code, signal, output}))
+  })
+}
+
+/**
+ * Delivers the requested signal or fails the test immediately.
+ * @param {import("node:child_process").ChildProcessWithoutNullStreams} child Spawned CLI.
+ * @param {TestTerminationSignal} signal Signal to deliver.
+ */
+function deliverTestSignal(child, signal) {
+  if (!child.kill(signal)) throw new Error(`could not deliver ${signal} to resume process`)
+}
+
+/**
+ * Releases a paused fake lifecycle and stops a child that did not exit as expected.
+ * @param {import("node:child_process").ChildProcessWithoutNullStreams} child Spawned CLI.
+ * @param {string} releasePause Pause-release path.
+ */
+function releasePausedChild(child, releasePause) {
+  if (!existsSync(releasePause)) writeFileSync(releasePause, "continue\n")
+  if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL")
+}
+
+/**
+ * Signals resume while its fake npm child is paused at an exact lifecycle stage, then releases that
+ * child so a deferring parent can finish cleanup and preserve signal termination semantics.
+ * @param {ScenarioContext} context The scenario context.
+ * @param {TestTerminationSignal} signal Signal to deliver directly to the CLI process.
+ * @param {string} stage Fake npm lifecycle stage.
+ * @param {Record<string, string>} [extraEnv] Additional fixture controls.
+ * @returns {Promise<{code: number | null, signal: string | null, output: string}>} CLI result.
+ */
+async function signalResumeAt(context, signal, stage, extraEnv = {}) {
+  const marker = join(context.workspace, `${stage}-paused`)
+  const releasePause = join(context.workspace, `${stage}-continue`)
+  const child = spawn(process.execPath, [releasePatchBin, "--resume"], {
+    cwd: context.work,
+    env: cliEnvironment(context, {
+      ...extraEnv,
+      NPM_PAUSE_AT: stage,
+      NPM_PAUSE_MARKER: marker,
+      NPM_PAUSE_RELEASE: releasePause
+    }),
+    stdio: "pipe"
+  })
+  const completion = collectChildResult(child)
+
+  try {
+    await waitForMarker(marker)
+    deliverTestSignal(child, signal)
+    writeFileSync(releasePause, "continue\n")
+
+    return await completion
+  } finally {
+    releasePausedChild(child, releasePause)
   }
 }
 
@@ -1427,13 +1565,246 @@ test("resume is a verified no-op when the tagged version is already published", 
   })
 })
 
-test("resume refuses when the latest tag does not point at the current master HEAD", () => {
-  withRelease({name: "my-pkg", version: "1.0.0", scripts: {}, packageLock: true, annotatedTags: ["v1.0.0"], published: [], extraCommit: true}, (context) => {
+/**
+ * Advances authoritative master after the release tag while keeping the manifest version unchanged.
+ * The master-only build script proves resume reads and executes the tagged manifest instead.
+ * @param {ScenarioContext} context The scenario context.
+ * @returns {string} The advanced master commit SHA.
+ */
+function advanceMasterAfterReleaseTag(context) {
+  writeFileSync(join(context.work, "package.json"), JSON.stringify({
+    name: "my-pkg",
+    version: "1.0.0",
+    scripts: {build: "master-only-build"}
+  }, null, 2) + "\n")
+  git(context.work, ["add", "package.json"])
+  git(context.work, ["commit", "-m", "advance master after release tag"])
+  git(context.work, ["push", "origin", "master"])
+
+  return revParse(context.work, "HEAD")
+}
+
+/**
+ * Advances master after the release tag and leaves the caller on a branch at that exact commit.
+ * @param {ScenarioContext} context The scenario context.
+ * @returns {string} The advanced master and caller commit SHA.
+ */
+function prepareAdvancedResumeCaller(context) {
+  const advancedMaster = advanceMasterAfterReleaseTag(context)
+  git(context.work, ["checkout", "-b", "caller"])
+
+  return advancedMaster
+}
+
+/**
+ * Runs resume from a caller branch after master advances, with the requested failing gate mutation.
+ * @param {ScenarioContext} context The scenario context.
+ * @param {Record<string, string>} env Environment controls for the failure.
+ * @returns {{advancedMaster: string, failure?: Error & {status?: number}, stdout: string, stderr: string, output: string}} The resume result and caller commit.
+ */
+function runAdvancedResumeFailure(context, env) {
+  const advancedMaster = prepareAdvancedResumeCaller(context)
+
+  return {advancedMaster, ...runCli(context, {resume: true, env})}
+}
+
+/**
+ * Asserts resume returned to the caller's exact branch/commit with a clean sole worktree.
+ * @param {ScenarioContext} context The scenario context.
+ * @param {string} callerHead Expected caller commit.
+ */
+function assertCallerCheckoutRestored(context, callerHead) {
+  assert.equal(git(context.work, ["branch", "--show-current"]).trim(), "caller")
+  assert.equal(revParse(context.work, "HEAD"), callerHead)
+  assert.equal(git(context.work, ["status", "--porcelain"]).trim(), "")
+  assert.deepEqual(
+    git(context.work, ["worktree", "list", "--porcelain"]).split("\n").filter((line) => line.startsWith("worktree ")),
+    [`worktree ${context.work}`]
+  )
+}
+
+/**
+ * Removes one temporary worktree intentionally leaked by the pre-fix process in RED signal tests.
+ * @param {ScenarioContext} context The scenario context.
+ * @param {string} worktree Leaked worktree path.
+ */
+function removeInterruptedResumeWorktree(context, worktree) {
+  git(context.work, ["worktree", "remove", "--force", worktree])
+  const temporaryRoot = dirname(worktree)
+  if (temporaryRoot.startsWith(join(tmpdir(), "release-patch-resume-"))) {
+    rmSync(temporaryRoot, {force: true, recursive: true})
+  }
+}
+
+/**
+ * Restores the fixture caller branch when the pre-fix process left it on master.
+ * @param {ScenarioContext} context The scenario context.
+ */
+function restoreInterruptedResumeCaller(context) {
+  if (git(context.work, ["branch", "--show-current"]).trim() !== "caller") {
+    git(context.work, ["checkout", "caller"])
+  }
+}
+
+/**
+ * Removes state intentionally leaked by the pre-fix process in RED signal tests.
+ * @param {ScenarioContext} context The scenario context.
+ */
+function cleanupInterruptedResumeFixture(context) {
+  const worktrees = git(context.work, ["worktree", "list", "--porcelain"])
+    .split("\n")
+    .filter((line) => line.startsWith("worktree "))
+    .map((line) => line.slice("worktree ".length))
+    .filter((worktree) => worktree !== context.work)
+
+  for (const worktree of worktrees) removeInterruptedResumeWorktree(context, worktree)
+  restoreInterruptedResumeCaller(context)
+}
+
+test("resume publishes the exact tagged tree after master advances and restores the caller checkout", () => {
+  withRelease({name: "my-pkg", version: "1.0.0", scripts: {}, packageLock: true, annotatedTags: ["v1.0.0"], published: []}, (context) => {
+    const taggedHead = revParse(context.work, "v1.0.0^{commit}")
+    const tagObject = revParse(context.work, "refs/tags/v1.0.0")
+    const advancedMaster = prepareAdvancedResumeCaller(context)
+
+    const commands = release(context, {resume: true})
+
+    assert.ok(registryOf(context).includes("my-pkg@1.0.0"), "resume must publish the tagged version")
+    assert.equal(commands.includes("npm run build"), false, "resume must not run a script added only on later master")
+    assert.ok(commands.some((command) => command.startsWith("git worktree add --detach ") && command.endsWith(` ${taggedHead}`)))
+    assert.ok(commands.includes(
+      `git push --atomic origin ${advancedMaster}:refs/heads/master ${tagObject}:refs/tags/v1.0.0`
+    ))
+    assert.equal(revParse(context.origin, "master"), advancedMaster, "resume must not rewind advanced master")
+    assertCallerCheckoutRestored(context, advancedMaster)
+  })
+})
+
+test("resume restores the caller checkout and removes the tagged worktree after a gate failure", () => {
+  withRelease({name: "my-pkg", version: "1.0.0", scripts: {}, packageLock: true, annotatedTags: ["v1.0.0"], published: []}, (context) => {
+    const {advancedMaster, failure, output} = runAdvancedResumeFailure(context, {NPM_DRYRUN_FAIL: "1"})
+
+    assert.ok(failure, "the publish dry-run fixture must fail")
+    assert.match(output, /publish dry-run failed/u)
+    assert.ok(commandsOf(context).includes("npm publish --dry-run"), "the failure must occur inside the tagged worktree")
+    assert.equal(commandsOf(context).includes("npm publish"), false)
+    assert.equal(ranCommand(commandsOf(context), "git push"), false)
+    assertCallerCheckoutRestored(context, advancedMaster)
+  })
+})
+
+/** @type {{signal: TestTerminationSignal, stage: string, expectedOutput: RegExp | null, extraEnv: Record<string, string>}[]} */
+const resumeSignalScenarios = [
+  {signal: /** @type {TestTerminationSignal} */ ("SIGINT"), stage: "install", expectedOutput: null, extraEnv: {}},
+  {signal: /** @type {TestTerminationSignal} */ ("SIGTERM"), stage: "verification", expectedOutput: null, extraEnv: {}},
+  {signal: /** @type {TestTerminationSignal} */ ("SIGTERM"), stage: "dry-run", expectedOutput: /publish dry-run failed/u, extraEnv: {NPM_DRYRUN_FAIL: "1"}}
+]
+
+for (const scenario of resumeSignalScenarios) {
+  test(`resume defers ${scenario.signal} during ${scenario.stage} until caller and worktree cleanup`, async () => {
+    await withReleaseAsync({name: "my-pkg", version: "1.0.0", scripts: {}, packageLock: true, annotatedTags: ["v1.0.0"], published: []}, async (context) => {
+      const advancedMaster = prepareAdvancedResumeCaller(context)
+      const result = await signalResumeAt(context, scenario.signal, scenario.stage, scenario.extraEnv)
+
+      try {
+        assert.equal(result.code, null, result.output)
+        assert.equal(result.signal, scenario.signal, result.output)
+        if (scenario.expectedOutput !== null) assert.match(result.output, scenario.expectedOutput)
+        assertCallerCheckoutRestored(context, advancedMaster)
+      } finally {
+        cleanupInterruptedResumeFixture(context)
+      }
+    })
+  })
+}
+
+test("resume refuses a clean detached HEAD move after its gates and restores the caller checkout", () => {
+  withRelease({name: "my-pkg", version: "1.0.0", scripts: {}, packageLock: true, annotatedTags: ["v1.0.0"], published: []}, (context) => {
+    const advancedMaster = advanceMasterAfterReleaseTag(context)
+    git(context.work, ["checkout", "-b", "caller"])
+    const {failure, output} = runCli(context, {resume: true, env: {DRYRUN_MOVE_HEAD: advancedMaster}})
+
+    assert.ok(failure, "a clean HEAD move away from the validated tag must block resume")
+    assert.match(output, /worktree HEAD.*exact validated commit .* tagged v1\.0\.0/u)
+    assert.equal(ranCommand(commandsOf(context), "git push"), false)
+    assert.equal(commandsOf(context).includes("npm publish"), false)
+    assert.equal(registryOf(context).includes("my-pkg@1.0.0"), false)
+    assertCallerCheckoutRestored(context, advancedMaster)
+  })
+})
+
+test("resume pushes the exact validated master and tag objects when local refs move concurrently", () => {
+  withRelease({name: "my-pkg", version: "1.0.0", scripts: {}, packageLock: true, annotatedTags: ["v1.0.0"], published: [], pushTags: false}, (context) => {
+    const validatedMaster = revParse(context.work, "master")
+    const validatedTagObject = revParse(context.work, "refs/tags/v1.0.0")
+
+    git(context.work, ["checkout", "-b", "moving-target"])
+    writeManifest(context.work, {name: "other-pkg", version: "9.9.9", scripts: {}})
+    git(context.work, ["add", "package.json"])
+    git(context.work, ["commit", "-m", "create a different local release target"])
+    const movedMaster = revParse(context.work, "HEAD")
+    git(context.work, ["tag", "-a", "alternate-object", "-m", "alternate-object"])
+    const movedTagObject = revParse(context.work, "refs/tags/alternate-object")
+    git(context.work, ["checkout", "master"])
+    git(context.work, ["checkout", "-b", "caller"])
+
+    const commands = release(context, {
+      resume: true,
+      env: {DRYRUN_MOVE_MASTER: movedMaster, DRYRUN_MOVE_RELEASE_TAG: movedTagObject}
+    })
+
+    assert.ok(registryOf(context).includes("my-pkg@1.0.0"), "resume must publish only the validated tagged package")
+    assert.equal(revParse(context.work, "master"), movedMaster, "the fixture must move the local master ref")
+    assert.equal(revParse(context.work, "refs/tags/v1.0.0"), movedTagObject, "the fixture must move the local tag ref")
+    assert.equal(revParse(context.origin, "master"), validatedMaster, "the moved local master object must not be pushed")
+    assert.equal(revParse(context.origin, "refs/tags/v1.0.0"), validatedTagObject, "the moved local tag object must not be pushed")
+    assert.ok(commands.includes(
+      `git push --atomic origin ${validatedMaster}:refs/heads/master ${validatedTagObject}:refs/tags/v1.0.0`
+    ))
+    assertCallerCheckoutRestored(context, validatedMaster)
+  })
+})
+
+test("resume refuses a release tag that is not an ancestor of current master and restores the caller checkout", () => {
+  withRelease({name: "my-pkg", version: "1.0.0", scripts: {}, packageLock: true, annotatedTags: [], published: []}, (context) => {
+    const masterHead = revParse(context.work, "master")
+    git(context.work, ["checkout", "-b", "side-release"])
+    git(context.work, ["commit", "--allow-empty", "-m", "release outside master"])
+    git(context.work, ["tag", "-a", "v1.0.0", "-m", "v1.0.0"])
+    git(context.work, ["push", "origin", "v1.0.0"])
+    git(context.work, ["checkout", "master"])
+    git(context.work, ["checkout", "-b", "caller"])
+
     const {failure, output} = runCli(context, {resume: true})
 
-    assert.ok(failure, "resume must refuse a tag that is not on HEAD")
-    assert.match(output, /can only publish v1\.0\.0 when it points at the current master HEAD/u)
+    assert.ok(failure, "resume must refuse a release outside master history")
+    assert.match(output, /v1\.0\.0.*not an ancestor of current master/u)
     assert.equal(registryOf(context).includes("my-pkg@1.0.0"), false)
+    assert.equal(ranCommand(commandsOf(context), "git worktree add"), false)
+    assertCallerCheckoutRestored(context, masterHead)
+  })
+})
+
+test("resume refuses a tagged package-name mismatch and restores the caller checkout", () => {
+  withRelease({name: "my-pkg", version: "1.0.0", scripts: {}, packageLock: true, annotatedTags: ["v1.0.0"], published: []}, (context) => {
+    writeFileSync(join(context.work, "package.json"), JSON.stringify({
+      name: "other-pkg",
+      version: "1.0.0",
+      scripts: {}
+    }, null, 2) + "\n")
+    git(context.work, ["add", "package.json"])
+    git(context.work, ["commit", "-m", "change package identity after release tag"])
+    git(context.work, ["push", "origin", "master"])
+    const advancedMaster = revParse(context.work, "HEAD")
+    git(context.work, ["checkout", "-b", "caller"])
+
+    const {failure, output} = runCli(context, {resume: true})
+
+    assert.ok(failure, "resume must refuse a different tagged package identity")
+    assert.match(output, /v1\.0\.0 declares name my-pkg, not current master package other-pkg/u)
+    assert.equal(ranCommand(commandsOf(context), "git push"), false)
+    assert.equal(commandsOf(context).includes("npm publish"), false)
+    assertCallerCheckoutRestored(context, advancedMaster)
   })
 })
 
