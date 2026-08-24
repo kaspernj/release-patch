@@ -664,6 +664,14 @@ test("defines a self-release script that runs the local CLI", () => {
   assert.equal(projectPackageJson.scripts["release:patch"], "node bin/release-patch.js")
 })
 
+test("fetches authoritative master history before the CI changed-file audit", () => {
+  assert.equal(
+    projectPackageJson.scripts["fallow:ci"],
+    "git fetch --no-tags --depth=2147483647 origin master:refs/remotes/origin/master && " +
+      "fallow audit --base origin/master --gate new-only --quiet"
+  )
+})
+
 test("runs an explicit build when only publish lifecycle scripts build", () => {
   withRelease({
     scripts: {build: "tsc", prepare: "npm run build", prepublishOnly: "npm run clean && npm run build"},
