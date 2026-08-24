@@ -1427,13 +1427,113 @@ test("resume is a verified no-op when the tagged version is already published", 
   })
 })
 
-test("resume refuses when the latest tag does not point at the current master HEAD", () => {
-  withRelease({name: "my-pkg", version: "1.0.0", scripts: {}, packageLock: true, annotatedTags: ["v1.0.0"], published: [], extraCommit: true}, (context) => {
+/**
+ * Advances authoritative master after the release tag while keeping the manifest version unchanged.
+ * The master-only build script proves resume reads and executes the tagged manifest instead.
+ * @param {ScenarioContext} context The scenario context.
+ * @returns {string} The advanced master commit SHA.
+ */
+function advanceMasterAfterReleaseTag(context) {
+  writeFileSync(join(context.work, "package.json"), JSON.stringify({
+    name: "my-pkg",
+    version: "1.0.0",
+    scripts: {build: "master-only-build"}
+  }, null, 2) + "\n")
+  git(context.work, ["add", "package.json"])
+  git(context.work, ["commit", "-m", "advance master after release tag"])
+  git(context.work, ["push", "origin", "master"])
+
+  return revParse(context.work, "HEAD")
+}
+
+/**
+ * Asserts resume returned to the caller's exact branch/commit with a clean sole worktree.
+ * @param {ScenarioContext} context The scenario context.
+ * @param {string} callerHead Expected caller commit.
+ */
+function assertCallerCheckoutRestored(context, callerHead) {
+  assert.equal(git(context.work, ["branch", "--show-current"]).trim(), "caller")
+  assert.equal(revParse(context.work, "HEAD"), callerHead)
+  assert.equal(git(context.work, ["status", "--porcelain"]).trim(), "")
+  assert.deepEqual(
+    git(context.work, ["worktree", "list", "--porcelain"]).split("\n").filter((line) => line.startsWith("worktree ")),
+    [`worktree ${context.work}`]
+  )
+}
+
+test("resume publishes the exact tagged tree after master advances and restores the caller checkout", () => {
+  withRelease({name: "my-pkg", version: "1.0.0", scripts: {}, packageLock: true, annotatedTags: ["v1.0.0"], published: []}, (context) => {
+    const taggedHead = revParse(context.work, "v1.0.0^{commit}")
+    const advancedMaster = advanceMasterAfterReleaseTag(context)
+    git(context.work, ["checkout", "-b", "caller"])
+
+    const commands = release(context, {resume: true})
+
+    assert.ok(registryOf(context).includes("my-pkg@1.0.0"), "resume must publish the tagged version")
+    assert.equal(commands.includes("npm run build"), false, "resume must not run a script added only on later master")
+    assert.ok(commands.some((command) => command.startsWith("git worktree add --detach ") && command.endsWith(` ${taggedHead}`)))
+    assert.ok(commands.includes("git push --atomic origin master v1.0.0"))
+    assert.equal(revParse(context.origin, "master"), advancedMaster, "resume must not rewind advanced master")
+    assertCallerCheckoutRestored(context, advancedMaster)
+  })
+})
+
+test("resume restores the caller checkout and removes the tagged worktree after a gate failure", () => {
+  withRelease({name: "my-pkg", version: "1.0.0", scripts: {}, packageLock: true, annotatedTags: ["v1.0.0"], published: []}, (context) => {
+    const advancedMaster = advanceMasterAfterReleaseTag(context)
+    git(context.work, ["checkout", "-b", "caller"])
+
+    const {failure, output} = runCli(context, {resume: true, env: {NPM_DRYRUN_FAIL: "1"}})
+
+    assert.ok(failure, "the publish dry-run fixture must fail")
+    assert.match(output, /publish dry-run failed/u)
+    assert.ok(commandsOf(context).includes("npm publish --dry-run"), "the failure must occur inside the tagged worktree")
+    assert.equal(commandsOf(context).includes("npm publish"), false)
+    assert.equal(ranCommand(commandsOf(context), "git push"), false)
+    assertCallerCheckoutRestored(context, advancedMaster)
+  })
+})
+
+test("resume refuses a release tag that is not an ancestor of current master and restores the caller checkout", () => {
+  withRelease({name: "my-pkg", version: "1.0.0", scripts: {}, packageLock: true, annotatedTags: [], published: []}, (context) => {
+    const masterHead = revParse(context.work, "master")
+    git(context.work, ["checkout", "-b", "side-release"])
+    git(context.work, ["commit", "--allow-empty", "-m", "release outside master"])
+    git(context.work, ["tag", "-a", "v1.0.0", "-m", "v1.0.0"])
+    git(context.work, ["push", "origin", "v1.0.0"])
+    git(context.work, ["checkout", "master"])
+    git(context.work, ["checkout", "-b", "caller"])
+
     const {failure, output} = runCli(context, {resume: true})
 
-    assert.ok(failure, "resume must refuse a tag that is not on HEAD")
-    assert.match(output, /can only publish v1\.0\.0 when it points at the current master HEAD/u)
+    assert.ok(failure, "resume must refuse a release outside master history")
+    assert.match(output, /v1\.0\.0.*not an ancestor of current master/u)
     assert.equal(registryOf(context).includes("my-pkg@1.0.0"), false)
+    assert.equal(ranCommand(commandsOf(context), "git worktree add"), false)
+    assertCallerCheckoutRestored(context, masterHead)
+  })
+})
+
+test("resume refuses a tagged package-name mismatch and restores the caller checkout", () => {
+  withRelease({name: "my-pkg", version: "1.0.0", scripts: {}, packageLock: true, annotatedTags: ["v1.0.0"], published: []}, (context) => {
+    writeFileSync(join(context.work, "package.json"), JSON.stringify({
+      name: "other-pkg",
+      version: "1.0.0",
+      scripts: {}
+    }, null, 2) + "\n")
+    git(context.work, ["add", "package.json"])
+    git(context.work, ["commit", "-m", "change package identity after release tag"])
+    git(context.work, ["push", "origin", "master"])
+    const advancedMaster = revParse(context.work, "HEAD")
+    git(context.work, ["checkout", "-b", "caller"])
+
+    const {failure, output} = runCli(context, {resume: true})
+
+    assert.ok(failure, "resume must refuse a different tagged package identity")
+    assert.match(output, /v1\.0\.0 declares name my-pkg, not current master package other-pkg/u)
+    assert.equal(ranCommand(commandsOf(context), "git push"), false)
+    assert.equal(commandsOf(context).includes("npm publish"), false)
+    assertCallerCheckoutRestored(context, advancedMaster)
   })
 })
 

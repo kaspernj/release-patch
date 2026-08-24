@@ -42,7 +42,7 @@ A release can be interrupted after the commit and tag are pushed but before the 
 release-patch --resume
 ```
 
-`--resume` publishes the **existing** latest annotated tag without bumping, committing or creating another tag. It only proceeds when the tag points at the current synced `master` HEAD and `package.json`'s version exactly matches the tag, so it can never publish a tree the tag does not record. It re-runs the dependency, build and dry-run gates, safely re-pushes the exact `master`/tag atomically (a no-op when they are already on `origin`), publishes that exact version and verifies it. If the version is already published, `--resume` is a verified no-op. Resume cannot be combined with another release mode.
+`--resume` publishes the **existing** latest annotated tag without bumping, committing or creating another tag. It syncs `master`, requires the tag to be an ancestor of current master history, and requires current master's package name/version to match the tagged release identity. It then creates an isolated detached Git worktree at the exact tagged commit, validates that tagged manifest and re-runs the dependency, build and dry-run gates there. This keeps later master changes out of the package while safely re-pushing current `master` and the exact tag atomically (a no-op when they are already on `origin`), publishing that exact tagged version and verifying it. The temporary worktree is removed and the caller's original branch or detached checkout is restored after every success or failure. If the version is already published, `--resume` is a verified no-op. Resume cannot be combined with another release mode.
 
 ## Reconciling an untagged published baseline
 
