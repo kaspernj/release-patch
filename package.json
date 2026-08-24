@@ -44,7 +44,7 @@
     "eslint": "^10.0.2",
     "eslint-plugin-jsdoc": "^63.0.0",
     "fallow": "^2.94.0",
-    "typescript": "^6.0.2"
+    "typescript": "^7.0.2"
   },
   "dependencies": {
     "validate-npm-package-name": "^6.0.2"
