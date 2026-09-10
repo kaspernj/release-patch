@@ -255,7 +255,10 @@ try {
   }
   if (process.env.GIT_ATOMIC_PUSH_FAIL === "1" && args[0] === "push" && args.includes("--atomic")) process.exit(1)
   if (process.env.GIT_TAG_PUSH_FAIL === "1" && args[0] === "push" && args.some((arg) => arg.includes(":refs/tags/"))) process.exit(1)
-  execFileSync(process.env.REAL_GIT, args, {stdio: "inherit"})
+  const delegatedArgs = args[0] === "ls-remote" && args[2] === process.env.GIT_ORIGIN_URL
+    ? [...args.slice(0, 2), process.env.GIT_ORIGIN_PATH, ...args.slice(3)]
+    : args
+  execFileSync(process.env.REAL_GIT, delegatedArgs, {stdio: "inherit"})
   if (process.env.GIT_TAG_PUSH_FAIL_AFTER_PUSH === "1" && args[0] === "push" && args.some((arg) => arg.includes(":refs/tags/"))) process.exit(1)
 } catch (error) {
   process.exit(typeof error.status === "number" ? error.status : 1)
@@ -1564,6 +1567,28 @@ test("bootstrap rejects multiple origin push URLs before release mutation", () =
     assertCliFailure(result, /origin must have exactly one non-empty push URL/u)
     assertNoReleaseMutations(commandsOf(context))
     assert.ok(commandsOf(context).includes("git remote get-url --push --all origin"))
+  })
+})
+
+test("bootstrap verifies the tag on origin's validated push URL instead of its fetch URL", () => {
+  withBootstrapPublishedBaseline((context, baselineHead) => {
+    const fetchOrigin = join(context.workspace, "fetch-origin.git")
+    git(context.workspace, ["init", "--bare", "--initial-branch=master", fetchOrigin])
+    git(context.work, ["push", fetchOrigin, "master"])
+    git(context.work, ["remote", "set-url", "origin", fetchOrigin])
+    git(context.work, ["remote", "set-url", "--add", "--push", "origin", context.origin])
+    clearCommands(context)
+
+    const result = runBootstrap(context, baselineHead)
+
+    assert.equal(result.failure, undefined, result.output)
+    assert.equal(git(fetchOrigin, ["tag", "-l", "v0.0.16"]).trim(), "")
+    assertBootstrapRemoteState(context, baselineHead)
+    assert.ok(commandsOf(context).includes(
+      "git ls-remote --tags git@github.com:fixture-owner/fixture-repository.git " +
+      "refs/tags/v0.0.16 refs/tags/v0.0.16^{}"
+    ))
+    assert.equal(commandsOf(context).some((command) => command.startsWith("git ls-remote --tags origin ")), false)
   })
 })
 

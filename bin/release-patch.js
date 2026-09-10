@@ -981,11 +981,12 @@ function bootstrapTagObject(releaseTag, gitHead) {
  * @param {string} releaseTag Baseline tag name.
  * @param {string} tagObject Immutable annotated tag object SHA.
  * @param {string} gitHead Authenticated historical commit SHA.
+ * @param {string} originPushUrl Validated sole origin push URL.
  */
-function ensureExactRemoteBaselineTag(releaseTag, tagObject, gitHead) {
+function ensureExactRemoteBaselineTag(releaseTag, tagObject, gitHead, originPushUrl) {
   const tagRef = `refs/tags/${releaseTag}`
   const peeledRef = `${tagRef}^{}`
-  const output = runCaptureArgs("git", ["ls-remote", "--tags", "origin", tagRef, peeledRef])
+  const output = runCaptureArgs("git", ["ls-remote", "--tags", originPushUrl, tagRef, peeledRef])
   const refs = new Map(output.trim().split("\n").filter(Boolean).map((line) => {
     const [object, ref] = line.trim().split(/\s+/u)
 
@@ -1006,13 +1007,14 @@ function ensureExactRemoteBaselineTag(releaseTag, tagObject, gitHead) {
  * @param {string} releaseTag Baseline tag name.
  * @param {string} tagObject Immutable annotated tag object SHA.
  * @param {string} gitHead Authenticated historical commit SHA.
+ * @param {string} originPushUrl Validated sole origin push URL.
  */
-function pushBootstrapTag(releaseTag, tagObject, gitHead) {
+function pushBootstrapTag(releaseTag, tagObject, gitHead, originPushUrl) {
   try {
     runArgs("git", ["push", "origin", `${tagObject}:refs/tags/${releaseTag}`])
   } catch (error) {
     try {
-      ensureExactRemoteBaselineTag(releaseTag, tagObject, gitHead)
+      ensureExactRemoteBaselineTag(releaseTag, tagObject, gitHead, originPushUrl)
       return
     } catch {
       throw new Error(
@@ -1024,7 +1026,7 @@ function pushBootstrapTag(releaseTag, tagObject, gitHead) {
     }
   }
 
-  ensureExactRemoteBaselineTag(releaseTag, tagObject, gitHead)
+  ensureExactRemoteBaselineTag(releaseTag, tagObject, gitHead, originPushUrl)
 }
 
 /**
@@ -1076,11 +1078,6 @@ function githubRepositoryFromOriginUrl(originUrl) {
   }
 
   return `${match[1]}/${match[2]}`
-}
-
-/** @returns {string} GitHub repository targeted by origin's push URL. */
-function githubRepositoryFromOrigin() {
-  return githubRepositoryFromOriginUrl(originPushUrl())
 }
 
 /**
@@ -1241,8 +1238,16 @@ function createOrVerifyGitHubRelease(packageName, version, releaseTag, gitHead, 
  * @param {string} expectedGitHead Operator-reviewed historical commit SHA.
  * @param {string} verifiedMasterHead Exact current master/origin master commit.
  * @param {string} githubRepository Exact `owner/repository` identity derived from origin.
+ * @param {string} originPushUrl Validated sole origin push URL.
  */
-function runPublishedBaselineBootstrap(packageName, version, expectedGitHead, verifiedMasterHead, githubRepository) {
+function runPublishedBaselineBootstrap(
+  packageName,
+  version,
+  expectedGitHead,
+  verifiedMasterHead,
+  githubRepository,
+  originPushUrl
+) {
   const releaseTag = `v${version}`
 
   ensureBootstrapTagSet(releaseTag)
@@ -1251,7 +1256,7 @@ function runPublishedBaselineBootstrap(packageName, version, expectedGitHead, ve
   ensureRegistryCommitIdentity(gitHead, packageName, version, verifiedMasterHead, "verified current master HEAD")
 
   const tagObject = bootstrapTagObject(releaseTag, gitHead)
-  pushBootstrapTag(releaseTag, tagObject, gitHead)
+  pushBootstrapTag(releaseTag, tagObject, gitHead, originPushUrl)
   createOrVerifyGitHubRelease(packageName, version, releaseTag, gitHead, githubRepository)
 
   console.log(
@@ -1884,13 +1889,14 @@ function ensureResumeMatchesTaggedCommit(packageJson, releaseTag, version, tagCo
 function runBootstrapMode(version, expectedGitHead) {
   const verifiedMasterHead = ensureBootstrapMasterCheckout()
   const packageJson = readValidatedPackageJson()
-  const githubRepository = githubRepositoryFromOrigin()
+  const pushUrl = originPushUrl()
+  const githubRepository = githubRepositoryFromOriginUrl(pushUrl)
 
   ensureNpmAuth()
   // Keep all local tags and fetch every remote tag: bootstrap must reject an existing semver tag,
   // never prune it away. The exact requested tag is accepted only as validated retry state.
   fetchTags()
-  runPublishedBaselineBootstrap(packageJson.name, version, expectedGitHead, verifiedMasterHead, githubRepository)
+  runPublishedBaselineBootstrap(packageJson.name, version, expectedGitHead, verifiedMasterHead, githubRepository, pushUrl)
 }
 
 /**
