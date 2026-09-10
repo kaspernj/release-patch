@@ -47,6 +47,6 @@
     "typescript": "^7.0.2"
   },
   "dependencies": {
-    "validate-npm-package-name": "^6.0.2"
+    "validate-npm-package-name": "^8.0.0"
   }
 }
