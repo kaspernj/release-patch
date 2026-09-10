@@ -18,6 +18,13 @@ const registryVisibilityWaitSeconds = [1, 2, 4, 8, 15, 30, 30, 30, 30]
 const registryVisibilityAttempts = registryVisibilityWaitSeconds.length + 1
 const registryVisibilityWindowSeconds = registryVisibilityWaitSeconds.reduce((total, seconds) => total + seconds, 0)
 
+const helpText = `Usage:
+  release-patch
+  release-patch --resume
+  release-patch --reconcile-published X.Y.Z --expected-git-head <40-character lowercase SHA>
+  release-patch --bootstrap-published X.Y.Z --expected-git-head <40-character lowercase SHA>
+  release-patch --help`
+
 /** @param {string} command The shell command to run, inheriting stdio. */
 function run(command) {
   execSync(command, {stdio: "inherit"})
@@ -44,6 +51,17 @@ function runCaptureArgs(file, args) {
 }
 
 /**
+ * Runs a command with explicit arguments while capturing both output streams for fail-closed status
+ * classification. Callers must not print the captured output because it crosses an external boundary.
+ * @param {string} file The executable to run.
+ * @param {string[]} args The arguments passed verbatim to the executable.
+ * @returns {string} The command's stdout.
+ */
+function runCaptureAllArgs(file, args) {
+  return execFileSync(file, args, {encoding: "utf8", stdio: ["ignore", "pipe", "pipe"]})
+}
+
+/**
  * Runs a command and captures its stdout so it can drive release decisions.
  * @param {string} command The shell command to run.
  * @returns {string} The command's stdout.
@@ -61,52 +79,91 @@ const releaseTagPattern = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u
  * Parses the CLI invocation, accepting only the documented flags and rejecting anything else so a
  * typo can never be silently ignored and run a destructive default.
  * @param {string[]} argv The full `process.argv`.
- * @returns {{resume: boolean, reconcilePublished?: string, expectedGitHead?: string}} The parsed release mode.
+ * @returns {{help: boolean, resume: boolean, reconcilePublished?: string, bootstrapPublished?: string, expectedGitHead?: string}} The parsed release mode.
  */
 function parseCliArgs(argv) {
   const args = argv.slice(2)
 
-  if (args.length === 0) return {resume: false}
-  if (args[0] === "--resume") return parseResumeArgs(args)
-  if (args[0] === "--reconcile-published") {
-    return parseReconcileArgs(args)
-  }
+  if (args.length === 0) return {help: false, resume: false}
+  const parser = cliModeParsers.get(args[0])
+
+  if (parser !== undefined) return parser(args)
 
   throw new Error(
-    `release-patch: unknown argument ${JSON.stringify(args[0])}. Supported modes are --resume and ` +
-    "--reconcile-published X.Y.Z --expected-git-head <SHA>; run without flags for a normal patch release. " +
+    `release-patch: unknown argument ${JSON.stringify(args[0])}. Supported modes are --resume, ` +
+    "--reconcile-published X.Y.Z --expected-git-head <SHA>, and " +
+    "--bootstrap-published X.Y.Z --expected-git-head <SHA>; run without flags for a normal patch release. " +
     "Reconcile consecutive published gaps by invoking each version separately with its own reviewed SHA."
   )
 }
 
 /**
+ * @param {string[]} args CLI arguments beginning with --help.
+ * @returns {{help: boolean, resume: boolean}} Help mode.
+ */
+function parseHelpArgs(args) {
+  if (args.length === 1) return {help: true, resume: false}
+  throw new Error("release-patch: --help cannot be combined with another release mode or argument.")
+}
+
+/**
  * @param {string[]} args CLI arguments beginning with --resume.
- * @returns {{resume: boolean}} Resume mode.
+ * @returns {{help: boolean, resume: boolean}} Resume mode.
  */
 function parseResumeArgs(args) {
-  if (args.length === 1) return {resume: true}
+  if (args.length === 1) return {help: false, resume: true}
   throw new Error("release-patch: --resume cannot be combined with another release mode or argument.")
 }
 
 /**
  * @param {string[]} args CLI arguments beginning with --reconcile-published.
- * @returns {{resume: boolean, reconcilePublished: string, expectedGitHead: string}} Reconcile mode.
+ * @returns {{help: boolean, resume: boolean, reconcilePublished: string, expectedGitHead: string}} Reconcile mode.
  */
 function parseReconcileArgs(args) {
   if (args.length !== 4) throwInvalidReconcileArgs()
   if (parseReleaseTag(`v${args[1]}`) === null) throwInvalidReconcileArgs()
 
-  return {resume: false, reconcilePublished: args[1], expectedGitHead: parseExpectedGitHead(args[2], args[3])}
+  return {
+    help: false,
+    resume: false,
+    reconcilePublished: args[1],
+    expectedGitHead: parseExpectedGitHead(args[2], args[3], throwInvalidReconcileArgs)
+  }
 }
+
+/**
+ * @param {string[]} args CLI arguments beginning with --bootstrap-published.
+ * @returns {{help: boolean, resume: boolean, bootstrapPublished: string, expectedGitHead: string}} Bootstrap mode.
+ */
+function parseBootstrapArgs(args) {
+  if (args.length !== 4) throwInvalidBootstrapArgs()
+  if (parseReleaseTag(`v${args[1]}`) === null) throwInvalidBootstrapArgs()
+
+  return {
+    help: false,
+    resume: false,
+    bootstrapPublished: args[1],
+    expectedGitHead: parseExpectedGitHead(args[2], args[3], throwInvalidBootstrapArgs)
+  }
+}
+
+/** @type {Map<string, (args: string[]) => {help: boolean, resume: boolean, reconcilePublished?: string, bootstrapPublished?: string, expectedGitHead?: string}>} */
+const cliModeParsers = new Map([
+  ["--help", parseHelpArgs],
+  ["--resume", parseResumeArgs],
+  ["--reconcile-published", parseReconcileArgs],
+  ["--bootstrap-published", parseBootstrapArgs]
+])
 
 /**
  * @param {string} flag Expected flag.
  * @param {string} sha Expected SHA.
+ * @param {() => never} invalidArgs Mode-specific invalid-argument error.
  * @returns {string} Validated SHA.
  */
-function parseExpectedGitHead(flag, sha) {
-  if (flag !== "--expected-git-head") throwInvalidReconcileArgs()
-  if (!/^[0-9a-f]{40}$/u.test(sha)) throwInvalidReconcileArgs()
+function parseExpectedGitHead(flag, sha, invalidArgs) {
+  if (flag !== "--expected-git-head") invalidArgs()
+  if (!/^[0-9a-f]{40}$/u.test(sha)) invalidArgs()
   return sha
 }
 
@@ -116,6 +173,16 @@ function parseExpectedGitHead(flag, sha) {
 function throwInvalidReconcileArgs() {
   throw new Error(
     "release-patch: reconciliation requires `--reconcile-published X.Y.Z --expected-git-head <40-character lowercase SHA>`."
+  )
+}
+
+/**
+ * @returns {never} Always throws.
+ */
+function throwInvalidBootstrapArgs() {
+  throw new Error(
+    "release-patch: published-baseline bootstrap requires `--bootstrap-published X.Y.Z " +
+    "--expected-git-head <40-character lowercase SHA>`."
   )
 }
 
@@ -214,12 +281,75 @@ function ensureLatestMaster() {
   run("git merge --ff-only origin/master")
 }
 
+/** @returns {string} The current branch name. */
+function bootstrapBranch() {
+  try {
+    return runCaptureArgs("git", ["symbolic-ref", "--quiet", "--short", "HEAD"]).trim()
+  } catch (error) {
+    throw new Error("release-patch: published-baseline bootstrap must be run from the master branch, not detached HEAD.", {cause: error})
+  }
+}
+
+/** @param {string} branch Current branch name. */
+function ensureBootstrapBranchIsMaster(branch) {
+  if (branch !== "master") {
+    throw new Error(
+      `release-patch: published-baseline bootstrap must be run from master, not ${branch}; ` +
+      "refusing to move a caller checkout while creating historical release state."
+    )
+  }
+}
+
+/** Fast-forwards bootstrap master with a mode-specific failure diagnostic. */
+function syncBootstrapMaster() {
+  try {
+    ensureLatestMaster()
+  } catch (error) {
+    throw new Error(
+      "release-patch: published-baseline bootstrap requires master to fast-forward cleanly to origin/master; " +
+      "the checkout may have diverged, so no historical tag was created.",
+      {cause: error}
+    )
+  }
+}
+
+/**
+ * @param {string} masterHead Local master SHA.
+ * @param {string} originMasterHead Remote-tracking master SHA.
+ */
+function ensureBootstrapMasterIsAuthoritative(masterHead, originMasterHead) {
+  if (masterHead !== originMasterHead) {
+    throw new Error(
+      `release-patch: published-baseline bootstrap requires local master ${masterHead} to exactly match ` +
+      `origin/master ${originMasterHead}; push or remove local-only commits before bootstrapping. No tag was created.`
+    )
+  }
+}
+
+/**
+ * Requires bootstrap to start on master and proves synced master is exactly origin/master. Unlike
+ * ordinary release modes, bootstrap will not switch away from another caller branch or accept local
+ * commits that have not reached the authoritative remote.
+ * @returns {string} The exact verified master commit SHA.
+ */
+function ensureBootstrapMasterCheckout() {
+  ensureBootstrapBranchIsMaster(bootstrapBranch())
+  syncBootstrapMaster()
+
+  const masterHead = runCaptureArgs("git", ["rev-parse", "--verify", "HEAD"]).trim()
+  const originMasterHead = runCaptureArgs("git", ["rev-parse", "--verify", "origin/master"]).trim()
+
+  ensureBootstrapMasterIsAuthoritative(masterHead, originMasterHead)
+
+  return masterHead
+}
+
 /**
  * Fetches tags from origin without disturbing local-only tags. A resume may publish a bootstrap tag
  * that has been created locally but not yet pushed, so it must not prune tags that origin lacks.
  */
 function fetchTags() {
-  run("git fetch origin --tags")
+  runArgs("git", ["fetch", "--no-tags", "origin", "refs/tags/*:refs/tags/*"])
 }
 
 /**
@@ -299,6 +429,20 @@ function annotatedReleaseTags() {
   }
 
   return tags
+}
+
+/**
+ * Enumerates exact stable semver tag names regardless of whether they are annotated or lightweight.
+ * Bootstrap is valid only before release history exists, so either kind is a collision.
+ * @returns {string[]} Stable semver release tag names.
+ */
+function semverReleaseTags() {
+  const output = runCaptureArgs("git", ["for-each-ref", "--format=%(refname:short)", "refs/tags"])
+
+  return output
+    .split("\n")
+    .map((tag) => tag.trim())
+    .filter((tag) => tag !== "" && parseReleaseTag(tag) !== null)
 }
 
 /**
@@ -679,10 +823,18 @@ function gitSucceeds(args) {
  * @param {string} gitHead The registry commit SHA.
  * @param {string} packageName The expected package identity.
  * @param {string} version The expected package version.
+ * @param {string} [historyRef] The exact authoritative history ref or object.
+ * @param {string} [historyDescription] Human-readable authoritative history.
  */
-function ensureRegistryCommitIdentity(gitHead, packageName, version) {
+function ensureRegistryCommitIdentity(
+  gitHead,
+  packageName,
+  version,
+  historyRef = "origin/master",
+  historyDescription = "origin/master"
+) {
   ensureRegistryCommitExists(gitHead, packageName, version)
-  ensureRegistryCommitReachable(gitHead, packageName, version)
+  ensureRegistryCommitReachable(gitHead, packageName, version, historyRef, historyDescription)
   ensureHistoricalManifestIdentity(packageJsonAtCommit(gitHead), gitHead, packageName, version)
 }
 
@@ -692,8 +844,19 @@ function ensureRegistryCommitIdentity(gitHead, packageName, version) {
  * @param {string} version Version.
  */
 function ensureRegistryCommitExists(gitHead, packageName, version) {
-  if (!gitSucceeds(["cat-file", "-e", `${gitHead}^{commit}`])) {
+  let objectType
+
+  try {
+    objectType = runCaptureArgs("git", ["cat-file", "-t", gitHead]).trim()
+  } catch (error) {
     throw new Error(`release-patch: registry gitHead ${gitHead} for ${packageName}@${version} is missing from this repository after fetching origin.`)
+  }
+
+  if (objectType !== "commit") {
+    throw new Error(
+      `release-patch: registry gitHead ${gitHead} for ${packageName}@${version} names a ${objectType} object, ` +
+      "not a commit object; no tag was created."
+    )
   }
 }
 
@@ -701,11 +864,13 @@ function ensureRegistryCommitExists(gitHead, packageName, version) {
  * @param {string} gitHead Commit SHA.
  * @param {string} packageName Package name.
  * @param {string} version Version.
+ * @param {string} historyRef Exact authoritative history ref or object.
+ * @param {string} historyDescription Human-readable authoritative history.
  */
-function ensureRegistryCommitReachable(gitHead, packageName, version) {
-  if (!gitSucceeds(["merge-base", "--is-ancestor", gitHead, "origin/master"])) {
+function ensureRegistryCommitReachable(gitHead, packageName, version, historyRef, historyDescription) {
+  if (!gitSucceeds(["merge-base", "--is-ancestor", gitHead, historyRef])) {
     throw new Error(
-      `release-patch: registry gitHead ${gitHead} for ${packageName}@${version} is not an ancestor of origin/master; ` +
+      `release-patch: registry gitHead ${gitHead} for ${packageName}@${version} is not an ancestor of ${historyDescription}; ` +
       "it does not belong to the authoritative release history, so no tag was created."
     )
   }
@@ -781,6 +946,323 @@ function createOrVerifyBaselineTag(releaseTag, gitHead) {
       `${gitHead}; refusing to move, replace or force-push it.`
     )
   }
+}
+
+/**
+ * Requires a pristine semver tag namespace, except for the one exact target tag that an interrupted
+ * bootstrap may already have created and that later provenance checks must verify byte-for-byte.
+ * @param {string} releaseTag The one resumable bootstrap tag.
+ */
+function ensureBootstrapTagSet(releaseTag) {
+  const collisions = semverReleaseTags().filter((tag) => tag !== releaseTag)
+
+  if (collisions.length > 0) {
+    throw new Error(
+      "release-patch: published-baseline bootstrap requires no existing local or remote semver release tags; " +
+      `found ${collisions.join(", ")}. Use ordinary reconciliation once release-tag history exists.`
+    )
+  }
+}
+
+/**
+ * Resolves the immutable annotated tag object after creating it or verifying resumable local state.
+ * @param {string} releaseTag Baseline tag name.
+ * @param {string} gitHead Authenticated historical commit.
+ * @returns {string} Annotated tag object SHA.
+ */
+function bootstrapTagObject(releaseTag, gitHead) {
+  createOrVerifyBaselineTag(releaseTag, gitHead)
+
+  return runCaptureArgs("git", ["rev-parse", "--verify", `refs/tags/${releaseTag}^{tag}`]).trim()
+}
+
+/**
+ * Reads the remote tag object and peeled commit and requires both to match the validated local state.
+ * @param {string} releaseTag Baseline tag name.
+ * @param {string} tagObject Immutable annotated tag object SHA.
+ * @param {string} gitHead Authenticated historical commit SHA.
+ * @param {string} originPushUrl Validated sole origin push URL.
+ */
+function ensureExactRemoteBaselineTag(releaseTag, tagObject, gitHead, originPushUrl) {
+  const tagRef = `refs/tags/${releaseTag}`
+  const peeledRef = `${tagRef}^{}`
+  const output = runCaptureArgs("git", ["ls-remote", "--tags", originPushUrl, tagRef, peeledRef])
+  const refs = new Map(output.trim().split("\n").filter(Boolean).map((line) => {
+    const [object, ref] = line.trim().split(/\s+/u)
+
+    return [ref, object]
+  }))
+
+  if (refs.get(tagRef) !== tagObject || refs.get(peeledRef) !== gitHead) {
+    throw new Error(
+      `release-patch: origin ${releaseTag} does not resolve to validated annotated tag object ${tagObject} ` +
+      `and historical commit ${gitHead}; refusing to continue to GitHub release creation.`
+    )
+  }
+}
+
+/**
+ * Pushes only the immutable annotated tag object. A failed command may have reached origin, so the
+ * remote is verified before deciding whether the exact invocation needs to be retried.
+ * @param {string} releaseTag Baseline tag name.
+ * @param {string} tagObject Immutable annotated tag object SHA.
+ * @param {string} gitHead Authenticated historical commit SHA.
+ * @param {string} originPushUrl Validated sole origin push URL.
+ */
+function pushBootstrapTag(releaseTag, tagObject, gitHead, originPushUrl) {
+  try {
+    runArgs("git", ["push", "origin", `${tagObject}:refs/tags/${releaseTag}`])
+  } catch (error) {
+    try {
+      ensureExactRemoteBaselineTag(releaseTag, tagObject, gitHead, originPushUrl)
+      return
+    } catch {
+      throw new Error(
+        `release-patch: the ${releaseTag} tag push failed with an uncertain remote outcome. The exact local ` +
+        "annotated tag was preserved without force or rewrite; inspect origin, then rerun the exact bootstrap " +
+        "invocation to verify and continue safely.",
+        {cause: error}
+      )
+    }
+  }
+
+  ensureExactRemoteBaselineTag(releaseTag, tagObject, gitHead, originPushUrl)
+}
+
+/**
+ * Reports whether a GitHub API failure unambiguously says a release is absent.
+ * @param {string} output Captured GitHub CLI failure output.
+ * @returns {boolean} Whether the API returned only HTTP 404.
+ */
+function isGitHubReleaseNotFound(output) {
+  const statuses = new Set([...output.matchAll(/\bHTTP\s+(\d{3})\b/gu)].map((match) => match[1]))
+
+  return statuses.size === 1 && statuses.has("404")
+}
+
+/** @returns {string} Origin's push URL. */
+function originPushUrl() {
+  let output
+
+  try {
+    output = runCaptureArgs("git", ["remote", "get-url", "--push", "--all", "origin"])
+  } catch (error) {
+    throw new Error(
+      "release-patch: could not read origin's push URL as an unambiguous GitHub repository; no release was created.",
+      {cause: error}
+    )
+  }
+
+  const pushUrls = output.split("\n").map((url) => url.trim()).filter(Boolean)
+  if (pushUrls.length !== 1) {
+    throw new Error(
+      "release-patch: origin must have exactly one non-empty push URL before published-baseline bootstrap; " +
+      "no tag or GitHub release was created."
+    )
+  }
+
+  return pushUrls[0]
+}
+
+/**
+ * Validates a GitHub origin URL without consulting ambient gh state.
+ * @param {string} originUrl Origin's push URL.
+ * @returns {string} Exact `owner/repository` identity.
+ */
+function githubRepositoryFromOriginUrl(originUrl) {
+  const match = /^(?:https:\/\/github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/u.exec(originUrl)
+  if (match === null || [match[1], match[2]].includes(".") || [match[1], match[2]].includes("..")) {
+    throw new Error(
+      "release-patch: origin's push URL must identify one unambiguous GitHub repository; no release was created."
+    )
+  }
+
+  return `${match[1]}/${match[2]}`
+}
+
+/**
+ * Reads a GitHub release through exact argv, returning null only for an unambiguous HTTP 404.
+ * @param {string} releaseTag Release tag name.
+ * @param {string} githubRepository Exact `owner/repository` identity derived from origin.
+ * @returns {unknown | null} Parsed release metadata, or null when absent.
+ */
+function githubReleaseMetadata(releaseTag, githubRepository) {
+  try {
+    const output = runCaptureAllArgs("gh", [
+      "api",
+      "--hostname",
+      "github.com",
+      "--method",
+      "GET",
+      `repos/${githubRepository}/releases/tags/${releaseTag}`
+    ])
+
+    return JSON.parse(output)
+  } catch (error) {
+    if (isGitHubReleaseNotFound(registryLookupOutput(error))) return null
+
+    throw new Error(
+      `release-patch: could not determine whether GitHub release ${releaseTag} exists; refusing to create or ` +
+      "overwrite release state while the API result is uncertain.",
+      {cause: error}
+    )
+  }
+}
+
+/**
+ * Requires the immutable public release shape created by bootstrap.
+ * @param {unknown} metadata GitHub API response.
+ * @param {string} releaseTag Expected release tag and title.
+ */
+function ensureExactGitHubRelease(metadata, releaseTag) {
+  const candidate = /** @type {{tag_name?: unknown, name?: unknown, draft?: unknown, prerelease?: unknown}} */ (Object(metadata))
+  const expectedFields = [
+    [candidate.tag_name, releaseTag],
+    [candidate.name, releaseTag],
+    [candidate.draft, false],
+    [candidate.prerelease, false]
+  ]
+
+  if (!expectedFields.every(([actual, expected]) => actual === expected)) {
+    throw new Error(
+      `release-patch: GitHub release ${releaseTag} exists but does not match the required public non-draft, ` +
+      "non-prerelease release with the exact tag title; refusing to edit or overwrite it."
+    )
+  }
+}
+
+/**
+ * Accepts an existing exact release as completed retry state.
+ * @param {string} releaseTag Release tag name.
+ * @param {string} githubRepository Exact `owner/repository` identity derived from origin.
+ * @returns {boolean} Whether an exact release already exists.
+ */
+function existingGitHubReleaseIsExact(releaseTag, githubRepository) {
+  const existing = githubReleaseMetadata(releaseTag, githubRepository)
+
+  if (existing === null) return false
+  ensureExactGitHubRelease(existing, releaseTag)
+
+  return true
+}
+
+/**
+ * Runs GitHub release creation and returns its failure for deterministic post-mutation verification.
+ * @param {string[]} args Exact GitHub CLI arguments.
+ * @returns {unknown | undefined} Creation failure, if any.
+ */
+function captureGitHubReleaseCreation(args) {
+  try {
+    runArgs("gh", args)
+    return undefined
+  } catch (error) {
+    return error
+  }
+}
+
+/**
+ * Verifies the release after a create attempt and reports safe retry instructions when still absent.
+ * @param {string} releaseTag Release tag name.
+ * @param {string} githubRepository Exact `owner/repository` identity derived from origin.
+ * @param {unknown} creationError GitHub CLI creation failure.
+ */
+function recoverGitHubReleaseCreation(releaseTag, githubRepository, creationError) {
+  const afterFailure = githubReleaseMetadata(releaseTag, githubRepository)
+  if (afterFailure !== null) {
+    ensureExactGitHubRelease(afterFailure, releaseTag)
+    return
+  }
+
+  throw new Error(
+    `release-patch: GitHub release creation for ${releaseTag} failed after its exact tag was verified on origin. ` +
+    "No release was overwritten; rerun the exact bootstrap invocation to verify or finish this release.",
+    {cause: creationError}
+  )
+}
+
+/**
+ * @param {string} releaseTag Release tag name.
+ * @param {string} githubRepository Exact `owner/repository` identity derived from origin.
+ */
+function verifyCreatedGitHubRelease(releaseTag, githubRepository) {
+  const created = githubReleaseMetadata(releaseTag, githubRepository)
+  if (created === null) {
+    throw new Error(
+      `release-patch: GitHub reported successful creation for ${releaseTag}, but the release is not readable. ` +
+      "Rerun the exact bootstrap invocation to verify the immutable result; no overwrite will be attempted."
+    )
+  }
+  ensureExactGitHubRelease(created, releaseTag)
+}
+
+/**
+ * Creates an absent GitHub release without editing an existing one. A failed create is re-read so an
+ * API response lost after a successful mutation remains safely resumable and idempotent.
+ * @param {string} packageName Validated package name.
+ * @param {string} version Published baseline version.
+ * @param {string} releaseTag Release tag name.
+ * @param {string} gitHead Authenticated historical commit SHA.
+ * @param {string} githubRepository Exact `owner/repository` identity derived from origin.
+ */
+function createOrVerifyGitHubRelease(packageName, version, releaseTag, gitHead, githubRepository) {
+  if (existingGitHubReleaseIsExact(releaseTag, githubRepository)) return
+
+  const notes = `Bootstrap published npm baseline ${packageName}@${version} at ${gitHead}.`
+  const createArgs = [
+    "release",
+    "create",
+    releaseTag,
+    "--repo",
+    `github.com/${githubRepository}`,
+    "--verify-tag",
+    "--title",
+    releaseTag,
+    "--notes",
+    notes
+  ]
+  const creationError = captureGitHubReleaseCreation(createArgs)
+
+  if (creationError !== undefined) {
+    recoverGitHubReleaseCreation(releaseTag, githubRepository, creationError)
+    return
+  }
+
+  verifyCreatedGitHubRelease(releaseTag, githubRepository)
+}
+
+/**
+ * Establishes the first historical release tag for an already-published package with no prior
+ * semver release history. This mode never publishes npm content or advances master.
+ * @param {string} packageName Validated current package name.
+ * @param {string} version Exact published baseline version.
+ * @param {string} expectedGitHead Operator-reviewed historical commit SHA.
+ * @param {string} verifiedMasterHead Exact current master/origin master commit.
+ * @param {string} githubRepository Exact `owner/repository` identity derived from origin.
+ * @param {string} originPushUrl Validated sole origin push URL.
+ */
+function runPublishedBaselineBootstrap(
+  packageName,
+  version,
+  expectedGitHead,
+  verifiedMasterHead,
+  githubRepository,
+  originPushUrl
+) {
+  const releaseTag = `v${version}`
+
+  ensureBootstrapTagSet(releaseTag)
+  const {gitHead} = publishedProvenance(packageName, version)
+  ensureExpectedGitHead(gitHead, expectedGitHead, packageName, version)
+  ensureRegistryCommitIdentity(gitHead, packageName, version, verifiedMasterHead, "verified current master HEAD")
+
+  const tagObject = bootstrapTagObject(releaseTag, gitHead)
+  pushBootstrapTag(releaseTag, tagObject, gitHead, originPushUrl)
+  createOrVerifyGitHubRelease(packageName, version, releaseTag, gitHead, githubRepository)
+
+  console.log(
+    `release-patch: bootstrapped published baseline ${releaseTag} at historical commit ${gitHead}; ` +
+    "the exact annotated tag and matching GitHub release are verified, and npm was not published again."
+  )
 }
 
 /**
@@ -896,8 +1378,9 @@ function runNormalRelease(packageJson, packageName, latest) {
   if (latest === null) {
     throw new Error(
       "release-patch: could not find a valid vX.Y.Z release tag to derive the next version from. " +
-      "To bootstrap a brand-new package, create an annotated tag matching package.json and HEAD and publish it " +
-      "with --resume (for example: git tag -a v0.0.0 -m v0.0.0 && release-patch --resume)."
+      "For an already-published package with no tags, use --bootstrap-published X.Y.Z --expected-git-head <SHA>. " +
+      "For a brand-new package, create an annotated tag matching package.json and HEAD and publish it with " +
+      "--resume (for example: git tag -a v0.0.0 -m v0.0.0 && release-patch --resume)."
     )
   }
 
@@ -1398,29 +1881,38 @@ function ensureResumeMatchesTaggedCommit(packageJson, releaseTag, version, tagCo
   }
 }
 
-/** Runs the release, choosing a normal patch release or a resume based on the CLI arguments. */
-function main() {
-  const {resume, reconcilePublished, expectedGitHead} = parseCliArgs(process.argv)
+/**
+ * Runs the strict published-baseline bootstrap after the shared clean-tree preflight.
+ * @param {string} version Explicit published version.
+ * @param {string} expectedGitHead Operator-reviewed historical commit.
+ */
+function runBootstrapMode(version, expectedGitHead) {
+  const verifiedMasterHead = ensureBootstrapMasterCheckout()
+  const packageJson = readValidatedPackageJson()
+  const pushUrl = originPushUrl()
+  const githubRepository = githubRepositoryFromOriginUrl(pushUrl)
 
-  // Refuse to run against a dirty tree before touching any branch, so stray edits can never leak into
-  // the release commit and `git checkout master` can never clobber uncommitted work.
-  ensureCleanWorkingTree()
+  ensureNpmAuth()
+  // Keep all local tags and fetch every remote tag: bootstrap must reject an existing semver tag,
+  // never prune it away. The exact requested tag is accepted only as validated retry state.
+  fetchTags()
+  runPublishedBaselineBootstrap(packageJson.name, version, expectedGitHead, verifiedMasterHead, githubRepository, pushUrl)
+}
 
-  if (resume) {
-    runResumeMode()
-    return
-  }
-
+/**
+ * Runs normal or sequential reconciliation behavior without changing its established state machine.
+ * @param {string | undefined} reconcilePublished Explicit published reconciliation version.
+ * @param {string | undefined} expectedGitHead Operator-reviewed historical commit.
+ */
+function runTagDerivedMode(reconcilePublished, expectedGitHead) {
   // Sync to the authoritative master before reading anything to publish, so the manifest we validate
   // and release is the fast-forwarded master, never stale feature-branch metadata carried across the sync.
   ensureLatestMaster()
 
-  // Validate the manifest read from the synced master checkout; misconfiguration fails before any mutation.
   const packageJson = readValidatedPackageJson()
   const packageName = packageJson.name
 
   ensureNpmAuth()
-
   // Git tags are the source of truth. Normal and reconciliation releases derive from origin's
   // authoritative tag set, pruning local-only or stale tags and force-updating changed ones first.
   fetchOriginAuthoritativeTags()
@@ -1431,6 +1923,32 @@ function main() {
   } else {
     runNormalRelease(packageJson, packageName, latest)
   }
+}
+
+/** Runs the release, choosing a normal patch release or a resume based on the CLI arguments. */
+function main() {
+  const {help, resume, reconcilePublished, bootstrapPublished, expectedGitHead} = parseCliArgs(process.argv)
+
+  if (help) {
+    console.log(helpText)
+    return
+  }
+
+  // Refuse to run against a dirty tree before touching any branch, so stray edits can never leak into
+  // the release commit and `git checkout master` can never clobber uncommitted work.
+  ensureCleanWorkingTree()
+
+  if (resume) {
+    runResumeMode()
+    return
+  }
+
+  if (bootstrapPublished !== undefined) {
+    runBootstrapMode(bootstrapPublished, /** @type {string} */ (expectedGitHead))
+    return
+  }
+
+  runTagDerivedMode(reconcilePublished, expectedGitHead)
 }
 
 try {
