@@ -238,6 +238,19 @@ const args = process.argv.slice(2)
 appendFileSync(process.env.COMMAND_LOG, "git " + args.join(" ") + "\\n")
 
 try {
+  if (args.join(" ") === "remote get-url --push origin" && process.env.GIT_ORIGIN_URL) {
+    process.stdout.write(process.env.GIT_ORIGIN_URL + "\\n")
+    process.exit(0)
+  }
+  if (args.join(" ") === "fetch origin --tags" && process.env.GIT_ADVANCE_ORIGIN_MASTER_ON_TAG_FETCH) {
+    execFileSync(process.env.REAL_GIT, [
+      "--git-dir",
+      process.env.GIT_ORIGIN_PATH,
+      "update-ref",
+      "refs/heads/master",
+      process.env.GIT_ADVANCE_ORIGIN_MASTER_ON_TAG_FETCH
+    ], {stdio: "inherit"})
+  }
   if (process.env.GIT_ATOMIC_PUSH_FAIL === "1" && args[0] === "push" && args.includes("--atomic")) process.exit(1)
   if (process.env.GIT_TAG_PUSH_FAIL === "1" && args[0] === "push" && args.some((arg) => arg.includes(":refs/tags/"))) process.exit(1)
   execFileSync(process.env.REAL_GIT, args, {stdio: "inherit"})
@@ -587,6 +600,8 @@ function cliEnvironment(context, extra = {}) {
     GITHUB_RELEASES_FILE: context.githubReleasesFile,
     NPM_VISIBILITY_STATE_FILE: context.visibilityStateFile,
     REAL_GIT: context.realGit,
+    GIT_ORIGIN_PATH: context.origin,
+    GIT_ORIGIN_URL: "git@github.com:fixture-owner/fixture-repository.git",
     ...extra
   }
 }
@@ -1487,11 +1502,75 @@ test("bootstraps the exact historical published commit with one annotated tag an
     assert.deepEqual(commands.filter((command) => command.startsWith("git push")), [
       `git push origin ${tagObject}:refs/tags/v0.0.16`
     ])
-    assert.ok(commands.includes("gh api --method GET repos/{owner}/{repo}/releases/tags/v0.0.16"))
     assert.ok(commands.includes(
-      `gh release create v0.0.16 --verify-tag --title v0.0.16 --notes Bootstrap published npm baseline my-pkg@0.0.16 at ${baselineHead}.`
+      "gh api --hostname github.com --method GET repos/fixture-owner/fixture-repository/releases/tags/v0.0.16"
+    ))
+    assert.ok(commands.includes(
+      `gh release create v0.0.16 --repo github.com/fixture-owner/fixture-repository --verify-tag --title v0.0.16 ` +
+      `--notes Bootstrap published npm baseline my-pkg@0.0.16 at ${baselineHead}.`
     ))
     assert.equal(commands.includes("npm publish"), false)
+  })
+})
+
+test("bootstrap binds every GitHub operation to the validated origin repository", () => {
+  withBootstrapPublishedBaseline((context, baselineHead) => {
+    const result = runBootstrap(context, baselineHead, {
+      env: {
+        GH_HOST: "wrong.example",
+        GH_REPO: "ambient-owner/wrong-repository",
+        GIT_ORIGIN_URL: "https://github.com/right-owner/right-repository.git"
+      }
+    })
+
+    assert.equal(result.failure, undefined, result.output)
+    const githubCommands = commandsOf(context).filter((command) => command.startsWith("gh "))
+    assert.ok(githubCommands.length >= 3)
+    assert.ok(githubCommands.filter((command) => command.startsWith("gh api ")).every((command) => {
+      return command.includes("--hostname github.com") &&
+        command.includes("repos/right-owner/right-repository/releases/tags/v0.0.16")
+    }))
+    assert.ok(githubCommands.some((command) => {
+      return command.startsWith("gh release create v0.0.16 --repo github.com/right-owner/right-repository ")
+    }))
+    assert.equal(githubCommands.some((command) => command.includes("ambient-owner/wrong-repository")), false)
+  })
+})
+
+test("bootstrap rejects an origin that is not an unambiguous GitHub repository", () => {
+  withBootstrapPublishedBaseline((context, baselineHead) => {
+    const result = runBootstrap(context, baselineHead, {
+      env: {GIT_ORIGIN_URL: "https://example.com/right-owner/right-repository.git"}
+    })
+
+    assertCliFailure(result, /origin.*unambiguous GitHub repository/u)
+    assertNoReleaseMutations(commandsOf(context))
+  })
+})
+
+test("bootstrap tag synchronization cannot advance origin/master after authoritative verification", () => {
+  withBootstrapPublishedBaseline((context, baselineHead) => {
+    const verifiedMaster = revParse(context.work, "HEAD")
+    const masterTree = revParse(context.work, "HEAD^{tree}")
+    const competingMaster = git(context.work, [
+      "commit-tree",
+      masterTree,
+      "-p",
+      verifiedMaster,
+      "-m",
+      "concurrent remote master"
+    ]).trim()
+    git(context.work, ["push", "origin", `${competingMaster}:refs/heads/race-candidate`])
+    clearCommands(context)
+
+    const result = runBootstrap(context, baselineHead, {
+      env: {GIT_ADVANCE_ORIGIN_MASTER_ON_TAG_FETCH: competingMaster}
+    })
+
+    assert.equal(result.failure, undefined, result.output)
+    assert.equal(revParse(context.origin, "master"), verifiedMaster)
+    assert.ok(commandsOf(context).includes("git fetch --no-tags origin refs/tags/*:refs/tags/*"))
+    assert.equal(commandsOf(context).includes("git fetch origin --tags"), false)
   })
 })
 
@@ -1530,6 +1609,16 @@ test("bootstrap rejects a nonexistent full Git SHA", () => {
     const missingHead = "f".repeat(40)
 
     assertBootstrapBlocked(context, missingHead, /gitHead f{40}.*missing from this repository/u)
+  })
+})
+
+test("bootstrap rejects an annotated-tag object SHA even when it peels to a commit", () => {
+  withBootstrapPublishedBaseline((context, baselineHead) => {
+    git(context.work, ["tag", "-a", "published-object", baselineHead, "-m", "published-object"])
+    const tagObject = revParse(context.work, "refs/tags/published-object")
+    clearCommands(context)
+
+    assertBootstrapBlocked(context, tagObject, /gitHead.*names a tag object, not a commit object/u)
   })
 })
 

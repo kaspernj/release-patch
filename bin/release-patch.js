@@ -349,7 +349,7 @@ function ensureBootstrapMasterCheckout() {
  * that has been created locally but not yet pushed, so it must not prune tags that origin lacks.
  */
 function fetchTags() {
-  run("git fetch origin --tags")
+  runArgs("git", ["fetch", "--no-tags", "origin", "refs/tags/*:refs/tags/*"])
 }
 
 /**
@@ -844,8 +844,19 @@ function ensureRegistryCommitIdentity(
  * @param {string} version Version.
  */
 function ensureRegistryCommitExists(gitHead, packageName, version) {
-  if (!gitSucceeds(["cat-file", "-e", `${gitHead}^{commit}`])) {
+  let objectType
+
+  try {
+    objectType = runCaptureArgs("git", ["cat-file", "-t", gitHead]).trim()
+  } catch (error) {
     throw new Error(`release-patch: registry gitHead ${gitHead} for ${packageName}@${version} is missing from this repository after fetching origin.`)
+  }
+
+  if (objectType !== "commit") {
+    throw new Error(
+      `release-patch: registry gitHead ${gitHead} for ${packageName}@${version} names a ${objectType} object, ` +
+      "not a commit object; no tag was created."
+    )
   }
 }
 
@@ -1027,18 +1038,54 @@ function isGitHubReleaseNotFound(output) {
   return statuses.size === 1 && statuses.has("404")
 }
 
+/** @returns {string} Origin's push URL. */
+function originPushUrl() {
+  try {
+    return runCaptureArgs("git", ["remote", "get-url", "--push", "origin"]).trim()
+  } catch (error) {
+    throw new Error(
+      "release-patch: could not read origin's push URL as an unambiguous GitHub repository; no release was created.",
+      {cause: error}
+    )
+  }
+}
+
+/**
+ * Validates a GitHub origin URL without consulting ambient gh state.
+ * @param {string} originUrl Origin's push URL.
+ * @returns {string} Exact `owner/repository` identity.
+ */
+function githubRepositoryFromOriginUrl(originUrl) {
+  const match = /^(?:https:\/\/github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/u.exec(originUrl)
+  if (match === null || [match[1], match[2]].includes(".") || [match[1], match[2]].includes("..")) {
+    throw new Error(
+      "release-patch: origin's push URL must identify one unambiguous GitHub repository; no release was created."
+    )
+  }
+
+  return `${match[1]}/${match[2]}`
+}
+
+/** @returns {string} GitHub repository targeted by origin's push URL. */
+function githubRepositoryFromOrigin() {
+  return githubRepositoryFromOriginUrl(originPushUrl())
+}
+
 /**
  * Reads a GitHub release through exact argv, returning null only for an unambiguous HTTP 404.
  * @param {string} releaseTag Release tag name.
+ * @param {string} githubRepository Exact `owner/repository` identity derived from origin.
  * @returns {unknown | null} Parsed release metadata, or null when absent.
  */
-function githubReleaseMetadata(releaseTag) {
+function githubReleaseMetadata(releaseTag, githubRepository) {
   try {
     const output = runCaptureAllArgs("gh", [
       "api",
+      "--hostname",
+      "github.com",
       "--method",
       "GET",
-      `repos/{owner}/{repo}/releases/tags/${releaseTag}`
+      `repos/${githubRepository}/releases/tags/${releaseTag}`
     ])
 
     return JSON.parse(output)
@@ -1078,10 +1125,11 @@ function ensureExactGitHubRelease(metadata, releaseTag) {
 /**
  * Accepts an existing exact release as completed retry state.
  * @param {string} releaseTag Release tag name.
+ * @param {string} githubRepository Exact `owner/repository` identity derived from origin.
  * @returns {boolean} Whether an exact release already exists.
  */
-function existingGitHubReleaseIsExact(releaseTag) {
-  const existing = githubReleaseMetadata(releaseTag)
+function existingGitHubReleaseIsExact(releaseTag, githubRepository) {
+  const existing = githubReleaseMetadata(releaseTag, githubRepository)
 
   if (existing === null) return false
   ensureExactGitHubRelease(existing, releaseTag)
@@ -1106,10 +1154,11 @@ function captureGitHubReleaseCreation(args) {
 /**
  * Verifies the release after a create attempt and reports safe retry instructions when still absent.
  * @param {string} releaseTag Release tag name.
+ * @param {string} githubRepository Exact `owner/repository` identity derived from origin.
  * @param {unknown} creationError GitHub CLI creation failure.
  */
-function recoverGitHubReleaseCreation(releaseTag, creationError) {
-  const afterFailure = githubReleaseMetadata(releaseTag)
+function recoverGitHubReleaseCreation(releaseTag, githubRepository, creationError) {
+  const afterFailure = githubReleaseMetadata(releaseTag, githubRepository)
   if (afterFailure !== null) {
     ensureExactGitHubRelease(afterFailure, releaseTag)
     return
@@ -1122,9 +1171,12 @@ function recoverGitHubReleaseCreation(releaseTag, creationError) {
   )
 }
 
-/** @param {string} releaseTag Release tag name. */
-function verifyCreatedGitHubRelease(releaseTag) {
-  const created = githubReleaseMetadata(releaseTag)
+/**
+ * @param {string} releaseTag Release tag name.
+ * @param {string} githubRepository Exact `owner/repository` identity derived from origin.
+ */
+function verifyCreatedGitHubRelease(releaseTag, githubRepository) {
+  const created = githubReleaseMetadata(releaseTag, githubRepository)
   if (created === null) {
     throw new Error(
       `release-patch: GitHub reported successful creation for ${releaseTag}, but the release is not readable. ` +
@@ -1141,20 +1193,32 @@ function verifyCreatedGitHubRelease(releaseTag) {
  * @param {string} version Published baseline version.
  * @param {string} releaseTag Release tag name.
  * @param {string} gitHead Authenticated historical commit SHA.
+ * @param {string} githubRepository Exact `owner/repository` identity derived from origin.
  */
-function createOrVerifyGitHubRelease(packageName, version, releaseTag, gitHead) {
-  if (existingGitHubReleaseIsExact(releaseTag)) return
+function createOrVerifyGitHubRelease(packageName, version, releaseTag, gitHead, githubRepository) {
+  if (existingGitHubReleaseIsExact(releaseTag, githubRepository)) return
 
   const notes = `Bootstrap published npm baseline ${packageName}@${version} at ${gitHead}.`
-  const createArgs = ["release", "create", releaseTag, "--verify-tag", "--title", releaseTag, "--notes", notes]
+  const createArgs = [
+    "release",
+    "create",
+    releaseTag,
+    "--repo",
+    `github.com/${githubRepository}`,
+    "--verify-tag",
+    "--title",
+    releaseTag,
+    "--notes",
+    notes
+  ]
   const creationError = captureGitHubReleaseCreation(createArgs)
 
   if (creationError !== undefined) {
-    recoverGitHubReleaseCreation(releaseTag, creationError)
+    recoverGitHubReleaseCreation(releaseTag, githubRepository, creationError)
     return
   }
 
-  verifyCreatedGitHubRelease(releaseTag)
+  verifyCreatedGitHubRelease(releaseTag, githubRepository)
 }
 
 /**
@@ -1164,8 +1228,9 @@ function createOrVerifyGitHubRelease(packageName, version, releaseTag, gitHead) 
  * @param {string} version Exact published baseline version.
  * @param {string} expectedGitHead Operator-reviewed historical commit SHA.
  * @param {string} verifiedMasterHead Exact current master/origin master commit.
+ * @param {string} githubRepository Exact `owner/repository` identity derived from origin.
  */
-function runPublishedBaselineBootstrap(packageName, version, expectedGitHead, verifiedMasterHead) {
+function runPublishedBaselineBootstrap(packageName, version, expectedGitHead, verifiedMasterHead, githubRepository) {
   const releaseTag = `v${version}`
 
   ensureBootstrapTagSet(releaseTag)
@@ -1175,7 +1240,7 @@ function runPublishedBaselineBootstrap(packageName, version, expectedGitHead, ve
 
   const tagObject = bootstrapTagObject(releaseTag, gitHead)
   pushBootstrapTag(releaseTag, tagObject, gitHead)
-  createOrVerifyGitHubRelease(packageName, version, releaseTag, gitHead)
+  createOrVerifyGitHubRelease(packageName, version, releaseTag, gitHead, githubRepository)
 
   console.log(
     `release-patch: bootstrapped published baseline ${releaseTag} at historical commit ${gitHead}; ` +
@@ -1807,12 +1872,13 @@ function ensureResumeMatchesTaggedCommit(packageJson, releaseTag, version, tagCo
 function runBootstrapMode(version, expectedGitHead) {
   const verifiedMasterHead = ensureBootstrapMasterCheckout()
   const packageJson = readValidatedPackageJson()
+  const githubRepository = githubRepositoryFromOrigin()
 
   ensureNpmAuth()
   // Keep all local tags and fetch every remote tag: bootstrap must reject an existing semver tag,
   // never prune it away. The exact requested tag is accepted only as validated retry state.
   fetchTags()
-  runPublishedBaselineBootstrap(packageJson.name, version, expectedGitHead, verifiedMasterHead)
+  runPublishedBaselineBootstrap(packageJson.name, version, expectedGitHead, verifiedMasterHead, githubRepository)
 }
 
 /**
