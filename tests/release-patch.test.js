@@ -40,6 +40,7 @@ const versionManifestFiles = ["package.json", "package-lock.json", "npm-shrinkwr
  * @property {string} fakeBin The directory holding the fake npm and logging git shim.
  * @property {string} commandLog The path the fake commands append their invocations to.
  * @property {string} registryFile The JSON file backing the fake npm registry.
+ * @property {string} githubReleasesFile The JSON file backing the fake GitHub releases.
  * @property {string} visibilityStateFile State used to simulate delayed registry propagation.
  * @property {string} realGit The absolute path to the real git binary.
  */
@@ -238,10 +239,70 @@ appendFileSync(process.env.COMMAND_LOG, "git " + args.join(" ") + "\\n")
 
 try {
   if (process.env.GIT_ATOMIC_PUSH_FAIL === "1" && args[0] === "push" && args.includes("--atomic")) process.exit(1)
+  if (process.env.GIT_TAG_PUSH_FAIL === "1" && args[0] === "push" && args.some((arg) => arg.includes(":refs/tags/"))) process.exit(1)
   execFileSync(process.env.REAL_GIT, args, {stdio: "inherit"})
+  if (process.env.GIT_TAG_PUSH_FAIL_AFTER_PUSH === "1" && args[0] === "push" && args.some((arg) => arg.includes(":refs/tags/"))) process.exit(1)
 } catch (error) {
   process.exit(typeof error.status === "number" ? error.status : 1)
 }
+`
+}
+
+/**
+ * Builds a fake GitHub CLI that records exact argv, models immutable release creation, and can
+ * simulate failures before or after the remote release mutation.
+ * @returns {string} The executable script contents.
+ */
+function fakeGhScript() {
+  return `#!/usr/bin/env node
+import {appendFileSync, existsSync, readFileSync, writeFileSync} from "node:fs"
+
+const args = process.argv.slice(2)
+appendFileSync(process.env.COMMAND_LOG, "gh " + args.join(" ") + "\\n")
+
+function readReleases() {
+  if (!existsSync(process.env.GITHUB_RELEASES_FILE)) return []
+  return JSON.parse(readFileSync(process.env.GITHUB_RELEASES_FILE, "utf8"))
+}
+
+function writeReleases(releases) {
+  writeFileSync(process.env.GITHUB_RELEASES_FILE, JSON.stringify(releases))
+}
+
+if (args[0] === "api") {
+  if (process.env.GH_API_FAIL === "1") {
+    process.stderr.write("gh: service unavailable (HTTP 503)\\n")
+    process.exit(1)
+  }
+
+  const tag = args.at(-1).split("/").at(-1)
+  const release = readReleases().find((candidate) => candidate.tag_name === tag)
+  if (!release) {
+    process.stderr.write("gh: Not Found (HTTP 404)\\n")
+    process.exit(1)
+  }
+
+  process.stdout.write(JSON.stringify(release) + "\\n")
+  process.exit(0)
+}
+
+if (args[0] === "release" && args[1] === "create") {
+  const tag = args[2]
+  const releases = readReleases()
+  if (releases.some((candidate) => candidate.tag_name === tag)) {
+    process.stderr.write("a release for this tag already exists\\n")
+    process.exit(1)
+  }
+  if (process.env.GH_CREATE_FAIL === "1") process.exit(1)
+
+  const titleIndex = args.indexOf("--title")
+  releases.push({tag_name: tag, name: args[titleIndex + 1], draft: false, prerelease: false})
+  writeReleases(releases)
+  if (process.env.GH_CREATE_FAIL_AFTER_WRITE === "1") process.exit(1)
+  process.exit(0)
+}
+
+process.exit(1)
 `
 }
 
@@ -348,6 +409,7 @@ function createWorkspace() {
     fakeBin: join(workspace, "bin"),
     commandLog: join(workspace, "commands.log"),
     registryFile: join(workspace, "registry.json"),
+    githubReleasesFile: join(workspace, "github-releases.json"),
     visibilityStateFile: join(workspace, "visibility.json")
   }
 
@@ -364,6 +426,7 @@ function createWorkspace() {
 function writeFakeBins(fakeBin) {
   writeExecutable(join(fakeBin, "npm"), fakeNpmScript())
   writeExecutable(join(fakeBin, "git"), fakeGitScript())
+  writeExecutable(join(fakeBin, "gh"), fakeGhScript())
   writeExecutable(join(fakeBin, "sleep"), fakeSleepScript())
 }
 
@@ -521,6 +584,7 @@ function cliEnvironment(context, extra = {}) {
     PATH: `${context.fakeBin}:${process.env.PATH}`,
     COMMAND_LOG: context.commandLog,
     REGISTRY_FILE: context.registryFile,
+    GITHUB_RELEASES_FILE: context.githubReleasesFile,
     NPM_VISIBILITY_STATE_FILE: context.visibilityStateFile,
     REAL_GIT: context.realGit,
     ...extra
@@ -670,6 +734,17 @@ function registryOf(context) {
 }
 
 /**
+ * Reads the fake GitHub release collection.
+ * @param {ScenarioContext} context The scenario context.
+ * @returns {Array<{tag_name: string, name: string, draft: boolean, prerelease: boolean}>} Releases.
+ */
+function githubReleasesOf(context) {
+  if (!existsSync(context.githubReleasesFile)) return []
+
+  return JSON.parse(readFileSync(context.githubReleasesFile, "utf8"))
+}
+
+/**
  * Runs a release expected to succeed and returns the recorded command log.
  * @param {ScenarioContext} context The scenario context.
  * @param {{resume?: boolean, args?: string[], env?: Record<string, string>}} [runOptions] The run controls.
@@ -729,7 +804,7 @@ function pushCommand(commands) {
 // A release "mutation" is any command that writes the version, records the release commit/tag, or
 // pushes/publishes it. `git tag -a` (not the read-only enumeration) and `npm publish` (including its
 // `--dry-run` gate) both count, so nothing irreversible may run before the preflights succeed.
-const releaseMutationPrefixes = ["npm version ", "git commit", "git tag -a", "git push", "npm publish"]
+const releaseMutationPrefixes = ["npm version ", "git commit", "git tag -a", "git push", "npm publish", "gh release create"]
 
 /**
  * Reports whether a recorded command is a release-producing mutation.
@@ -1098,6 +1173,7 @@ test("fails with an actionable bootstrap message when no valid release tag exist
   withRelease({scripts: {}, packageLock: true, annotatedTags: []}, (context) => {
     const output = assertBlocked(context, /could not find a valid vX\.Y\.Z release tag/u)
 
+    assert.match(output, /--bootstrap-published X\.Y\.Z --expected-git-head <SHA>/u)
     assert.match(output, /git tag -a v0\.0\.0 -m v0\.0\.0/u)
     assert.match(output, /--resume/u)
   })
@@ -1183,6 +1259,21 @@ test("rejects unknown CLI arguments before doing anything", () => {
 })
 
 /**
+ * Commits one package manifest revision in a release scenario.
+ * @param {ScenarioContext} context The scenario context.
+ * @param {{name: string, version: string, scripts: Record<string, string>}} manifest Package manifest.
+ * @param {string} message Commit message.
+ * @returns {string} New commit SHA.
+ */
+function commitScenarioManifest(context, manifest, message) {
+  writeFileSync(join(context.work, "package.json"), JSON.stringify(manifest, null, 2) + "\n")
+  git(context.work, ["add", "package.json"])
+  git(context.work, ["commit", "-m", message])
+
+  return revParse(context.work, "HEAD")
+}
+
+/**
  * Adds an untagged published baseline commit followed by newer development on master.
  * @param {ScenarioContext} context The scenario context.
  * @param {{name?: string, baselineName?: string, baselineVersion?: string, currentVersion?: string, currentScripts?: Record<string, string>}} [options] Fixture values.
@@ -1193,19 +1284,422 @@ function addUntaggedPublishedBaseline(context, options) {
   const name = fixture.name
   const baselineVersion = fixture.baselineVersion
 
-  writeFileSync(join(context.work, "package.json"), JSON.stringify({name: fixture.baselineName, version: baselineVersion, scripts: {}}, null, 2) + "\n")
-  git(context.work, ["add", "package.json"])
-  git(context.work, ["commit", "-m", `release ${baselineVersion} without tag`])
-  const baselineHead = revParse(context.work, "HEAD")
+  const baselineHead = commitScenarioManifest(
+    context,
+    {name: fixture.baselineName, version: baselineVersion, scripts: {}},
+    `release ${baselineVersion} without tag`
+  )
 
-  writeFileSync(join(context.work, "package.json"), JSON.stringify({name, version: fixture.currentVersion, scripts: fixture.currentScripts}, null, 2) + "\n")
-  git(context.work, ["add", "package.json"])
-  git(context.work, ["commit", "-m", "later development"])
+  commitScenarioManifest(context, {name, version: fixture.currentVersion, scripts: fixture.currentScripts}, "later development")
   git(context.work, ["push", "origin", "master"])
   writeFileSync(context.registryFile, JSON.stringify([`${name}@0.5.9`, `${name}@${baselineVersion}`]))
 
   return baselineHead
 }
+
+/**
+ * Adds the historical published commit used by a no-tag bootstrap, followed by current master work.
+ * @param {ScenarioContext} context The scenario context.
+ * @param {{name?: string, baselineName?: string, baselineVersion?: string, manifestVersion?: string, currentVersion?: string}} [options] Fixture values.
+ * @returns {string} The historical published commit SHA.
+ */
+function addBootstrapPublishedBaseline(context, options = {}) {
+  const fixture = {
+    name: "my-pkg",
+    baselineName: "my-pkg",
+    baselineVersion: "0.0.16",
+    manifestVersion: options.baselineVersion ?? "0.0.16",
+    currentVersion: "0.1.0",
+    ...options
+  }
+
+  const baselineHead = commitScenarioManifest(
+    context,
+    {name: fixture.baselineName, version: fixture.manifestVersion, scripts: {}},
+    `publish ${fixture.baselineVersion} without a tag`
+  )
+
+  commitScenarioManifest(context, {name: fixture.name, version: fixture.currentVersion, scripts: {}}, "later development")
+  git(context.work, ["push", "origin", "master"])
+  writeFileSync(context.registryFile, JSON.stringify([`${fixture.name}@${fixture.baselineVersion}`]))
+
+  return baselineHead
+}
+
+/**
+ * Runs the published-baseline bootstrap with authenticated fake registry provenance.
+ * @param {ScenarioContext} context The scenario context.
+ * @param {string} gitHead The expected and registry Git commit.
+ * @param {{version?: string, expectedGitHead?: string, registryVersion?: string, registryGitHead?: string, env?: Record<string, string>}} [options] Overrides.
+ * @returns {{failure?: Error & {status?: number}, stdout: string, stderr: string, output: string}} CLI result.
+ */
+function runBootstrap(context, gitHead, options = {}) {
+  const requested = {version: "0.0.16", ...options}
+  const settings = {
+    expectedGitHead: gitHead,
+    registryVersion: requested.version,
+    registryGitHead: gitHead,
+    env: {},
+    ...requested
+  }
+
+  return runCli(context, {
+    args: ["--bootstrap-published", settings.version, "--expected-git-head", settings.expectedGitHead],
+    env: {
+      NPM_METADATA_VERSION: settings.registryVersion,
+      NPM_METADATA_GIT_HEAD: settings.registryGitHead,
+      ...settings.env
+    }
+  })
+}
+
+/**
+ * Runs bootstrap expecting a pre-mutation failure.
+ * @param {ScenarioContext} context The scenario context.
+ * @param {string} gitHead Expected historical Git commit.
+ * @param {RegExp} pattern Expected failure diagnostic.
+ * @param {{version?: string, expectedGitHead?: string, registryVersion?: string, registryGitHead?: string, env?: Record<string, string>}} [options] Overrides.
+ * @returns {string} Combined CLI output.
+ */
+function assertBootstrapBlocked(context, gitHead, pattern, options = {}) {
+  const result = runBootstrap(context, gitHead, options)
+
+  assert.ok(result.failure)
+  assert.match(result.output, pattern)
+  assertNoReleaseMutations(commandsOf(context))
+
+  return result.output
+}
+
+/**
+ * Builds the standard no-tag published-history fixture used by bootstrap behavior tests.
+ * @param {(context: ScenarioContext, baselineHead: string) => void} body Test body.
+ * @param {{name?: string, baselineName?: string, baselineVersion?: string, manifestVersion?: string, currentVersion?: string}} [baselineOptions] Baseline overrides.
+ */
+function withBootstrapPublishedBaseline(body, baselineOptions = {}) {
+  withRelease({name: "my-pkg", version: "0.0.1", scripts: {}, packageLock: true}, (context) => {
+    body(context, addBootstrapPublishedBaseline(context, baselineOptions))
+  })
+}
+
+const exactBootstrapRelease = {
+  tag_name: "v0.0.16",
+  name: "v0.0.16",
+  draft: false,
+  prerelease: false
+}
+
+/**
+ * Asserts the immutable remote result shared by successful bootstrap and recovery paths.
+ * @param {ScenarioContext} context The scenario context.
+ * @param {string} baselineHead Authenticated historical commit.
+ */
+function assertBootstrapRemoteState(context, baselineHead) {
+  assert.equal(revParse(context.origin, "v0.0.16^{commit}"), baselineHead)
+  assert.deepEqual(githubReleasesOf(context), [exactBootstrapRelease])
+}
+
+/**
+ * Asserts that a retry reused existing immutable state instead of recreating or publishing it.
+ * @param {ScenarioContext} context The scenario context.
+ * @param {{includeRelease?: boolean}} [options] Whether GitHub release creation must also be absent.
+ */
+function assertBootstrapRetryDidNotRewrite(context, options = {}) {
+  const commands = commandsOf(context)
+
+  assert.equal(commands.some((command) => command.startsWith("git tag -a")), false)
+  assert.equal(commands.includes("npm publish"), false)
+  assert.equal(commands.some((command) => {
+    return /(?:^|\s)(?:--force|-f|--force-with-lease)(?:\s|$)/u.test(command)
+  }), false)
+  if (options.includeRelease === true) {
+    assert.equal(commands.some((command) => command.startsWith("gh release create")), false)
+  }
+}
+
+/**
+ * Asserts a CLI failure without assuming it happened before all mutations.
+ * @param {{failure?: Error & {status?: number}, output: string}} result CLI result.
+ * @param {RegExp} pattern Expected failure diagnostic.
+ */
+function assertCliFailure(result, pattern) {
+  assert.ok(result.failure)
+  assert.match(result.output, pattern)
+}
+
+/**
+ * Retries an interrupted bootstrap and verifies reuse of its immutable state.
+ * @param {ScenarioContext} context The scenario context.
+ * @param {string} baselineHead Authenticated historical commit.
+ */
+function resumeBootstrapAfterFailure(context, baselineHead) {
+  clearCommands(context)
+  const result = runBootstrap(context, baselineHead)
+
+  assert.equal(result.failure, undefined, result.output)
+  assertBootstrapRetryDidNotRewrite(context)
+  assertBootstrapRemoteState(context, baselineHead)
+}
+
+test("documents the published-baseline bootstrap in CLI help without touching release state", () => {
+  withRelease({name: "my-pkg", scripts: {}, packageLock: true}, (context) => {
+    const result = runCli(context, {args: ["--help"]})
+
+    assert.equal(result.failure, undefined, result.output)
+    assert.match(result.stdout, /--bootstrap-published X\.Y\.Z --expected-git-head <40-character lowercase SHA>/u)
+    assert.deepEqual(commandsOf(context), [])
+  })
+})
+
+test("bootstrap requires an exact version and full lowercase Git SHA", () => {
+  withRelease({name: "my-pkg", scripts: {}, packageLock: true}, (context) => {
+    const invalidArgv = [
+      ["--bootstrap-published"],
+      ["--bootstrap-published", "next", "--expected-git-head", "a".repeat(40)],
+      ["--bootstrap-published", "0.0.16", "--expected-git-head", "abc123"],
+      ["--bootstrap-published", "0.0.16", "--expected-git-head", "A".repeat(40)]
+    ]
+
+    for (const args of invalidArgv) {
+      assertBlocked(context, /bootstrap requires.*X\.Y\.Z.*40-character lowercase SHA/u, {args})
+      clearCommands(context)
+    }
+  })
+})
+
+test("bootstraps the exact historical published commit with one annotated tag and GitHub release", () => {
+  withBootstrapPublishedBaseline((context, baselineHead) => {
+    const currentHead = revParse(context.work, "HEAD")
+    const result = runBootstrap(context, baselineHead)
+
+    assert.equal(result.failure, undefined, result.output)
+    assert.notEqual(baselineHead, currentHead, "the fixture must prove the tag does not target current HEAD")
+    assert.equal(git(context.origin, ["cat-file", "-t", "v0.0.16"]).trim(), "tag")
+    assert.equal(revParse(context.origin, "v0.0.16^{commit}"), baselineHead)
+    assert.equal(revParse(context.origin, "master"), currentHead)
+    assertBootstrapRemoteState(context, baselineHead)
+
+    const commands = commandsOf(context)
+    const tagObject = revParse(context.work, "refs/tags/v0.0.16")
+
+    assert.ok(commands.includes("npm view my-pkg@0.0.16 version gitHead --json"))
+    assert.ok(commands.includes(`git tag -a v0.0.16 ${baselineHead} -m v0.0.16`))
+    assert.deepEqual(commands.filter((command) => command.startsWith("git push")), [
+      `git push origin ${tagObject}:refs/tags/v0.0.16`
+    ])
+    assert.ok(commands.includes("gh api --method GET repos/{owner}/{repo}/releases/tags/v0.0.16"))
+    assert.ok(commands.includes(
+      `gh release create v0.0.16 --verify-tag --title v0.0.16 --notes Bootstrap published npm baseline my-pkg@0.0.16 at ${baselineHead}.`
+    ))
+    assert.equal(commands.includes("npm publish"), false)
+  })
+})
+
+test("bootstrap fails closed for unpublished or incomplete registry provenance", () => {
+  withBootstrapPublishedBaseline((context, baselineHead) => {
+    writeFileSync(context.registryFile, "[]")
+
+    assertBlocked(context, /could not authenticate registry metadata for my-pkg@0\.0\.16/u, {
+      args: ["--bootstrap-published", "0.0.16", "--expected-git-head", baselineHead]
+    })
+
+    clearCommands(context)
+    writeFileSync(context.registryFile, JSON.stringify(["my-pkg@0.0.16"]))
+    assertBlocked(context, /registry metadata.*gitHead/u, {
+      args: ["--bootstrap-published", "0.0.16", "--expected-git-head", baselineHead],
+      env: {NPM_METADATA_VERSION: "0.0.16", NPM_METADATA_GIT_HEAD: ""}
+    })
+  })
+})
+
+test("bootstrap rejects registry version or operator Git SHA mismatches", () => {
+  withBootstrapPublishedBaseline((context, baselineHead) => {
+    assertBootstrapBlocked(context, baselineHead, /registry metadata.*version 0\.0\.16/u, {
+      registryVersion: "0.0.15"
+    })
+
+    clearCommands(context)
+    assertBootstrapBlocked(context, baselineHead, /does not exactly match.*expected baseline/u, {
+      expectedGitHead: revParse(context.work, "HEAD")
+    })
+  })
+})
+
+test("bootstrap rejects a nonexistent full Git SHA", () => {
+  withBootstrapPublishedBaseline((context) => {
+    const missingHead = "f".repeat(40)
+
+    assertBootstrapBlocked(context, missingHead, /gitHead f{40}.*missing from this repository/u)
+  })
+})
+
+test("bootstrap rejects an unrelated commit outside verified master history", () => {
+  withBootstrapPublishedBaseline((context) => {
+    const tree = revParse(context.work, "HEAD^{tree}")
+    const foreignHead = git(context.work, ["commit-tree", tree, "-m", "foreign history"]).trim()
+
+    assertBootstrapBlocked(context, foreignHead, /not an ancestor of (?:verified )?(?:current master|origin\/master)/u)
+  })
+})
+
+test("bootstrap rejects a historical manifest version mismatch", () => {
+  withBootstrapPublishedBaseline((context, baselineHead) => {
+    assertBootstrapBlocked(context, baselineHead, /declares version 0\.0\.15, not registry version 0\.0\.16/u)
+  }, {manifestVersion: "0.0.15"})
+})
+
+test("bootstrap rejects a historical package-name mismatch", () => {
+  withBootstrapPublishedBaseline((context, baselineHead) => {
+    assertBootstrapBlocked(context, baselineHead, /declares name other-pkg, not the current package identity my-pkg/u)
+  }, {baselineName: "other-pkg"})
+})
+
+test("bootstrap rejects dirty and non-master checkouts before release mutations", () => {
+  withBootstrapPublishedBaseline((context, baselineHead) => {
+    writeFileSync(join(context.work, "dirty.txt"), "dirty\n")
+    let result = runBootstrap(context, baselineHead)
+
+    assertCliFailure(result, /working tree has uncommitted changes/u)
+    assertNoReleaseMutations(commandsOf(context))
+
+    rmSync(join(context.work, "dirty.txt"))
+    clearCommands(context)
+    git(context.work, ["checkout", "-b", "feature"])
+    result = runBootstrap(context, baselineHead)
+    assertCliFailure(result, /bootstrap.*must be run from master/u)
+    assertNoReleaseMutations(commandsOf(context))
+  })
+})
+
+test("bootstrap rejects a diverged master checkout", () => {
+  withBootstrapPublishedBaseline((context, baselineHead) => {
+    git(context.work, ["commit", "--allow-empty", "-m", "local-only work"])
+
+    const peer = join(context.workspace, "peer")
+    git(context.workspace, ["clone", context.origin, peer])
+    git(peer, ["config", "user.email", "release-patch-test@example.com"])
+    git(peer, ["config", "user.name", "release-patch-test"])
+    git(peer, ["commit", "--allow-empty", "-m", "remote-only work"])
+    git(peer, ["push", "origin", "master"])
+
+    assertBootstrapBlocked(context, baselineHead, /bootstrap.*master.*diverged|fast-forward/u)
+  })
+})
+
+test("bootstrap rejects existing local or remote semver release tags", () => {
+  withBootstrapPublishedBaseline((context, baselineHead) => {
+    git(context.work, ["tag", "-a", "v0.0.1", "-m", "v0.0.1"])
+
+    assertBootstrapBlocked(context, baselineHead, /bootstrap requires no existing.*semver release tags.*v0\.0\.1/u)
+
+    git(context.work, ["tag", "-d", "v0.0.1"])
+    git(context.work, ["tag", "-a", "v0.0.2", "-m", "v0.0.2"])
+    git(context.work, ["push", "origin", "v0.0.2"])
+    git(context.work, ["tag", "-d", "v0.0.2"])
+    clearCommands(context)
+
+    assertBootstrapBlocked(context, baselineHead, /bootstrap requires no existing.*semver release tags.*v0\.0\.2/u)
+  })
+})
+
+test("bootstrap refuses to reinterpret an existing target tag on the wrong commit", () => {
+  withBootstrapPublishedBaseline((context, baselineHead) => {
+    git(context.work, ["tag", "-a", "v0.0.16", "-m", "v0.0.16"])
+
+    assertBootstrapBlocked(context, baselineHead, /tag v0\.0\.16 already exists.*refusing to move, replace or force-push/u)
+  })
+})
+
+test("ordinary reconciliation still rejects a repository with no annotated release baseline", () => {
+  withBootstrapPublishedBaseline((context, baselineHead) => {
+    assertReconciliationBlocked(context, /latest annotated release tag \(none\)/u, baselineHead)
+  })
+})
+
+test("bootstrap safely resumes after a failed exact-tag push", () => {
+  withBootstrapPublishedBaseline((context, baselineHead) => {
+    const result = runBootstrap(context, baselineHead, {env: {GIT_TAG_PUSH_FAIL: "1"}})
+
+    assertCliFailure(result, /tag push.*rerun the exact bootstrap/u)
+    assert.equal(git(context.work, ["cat-file", "-t", "v0.0.16"]).trim(), "tag")
+    assert.equal(git(context.origin, ["tag", "-l", "v0.0.16"]).trim(), "")
+    assert.deepEqual(githubReleasesOf(context), [])
+    resumeBootstrapAfterFailure(context, baselineHead)
+  })
+})
+
+test("bootstrap verifies the exact remote tag after a lost push response", () => {
+  withBootstrapPublishedBaseline((context, baselineHead) => {
+    const result = runBootstrap(context, baselineHead, {env: {GIT_TAG_PUSH_FAIL_AFTER_PUSH: "1"}})
+
+    assert.equal(result.failure, undefined, result.output)
+    assert.equal(commandsOf(context).filter((command) => command.startsWith("git push origin")).length, 1)
+    assertBootstrapRemoteState(context, baselineHead)
+  })
+})
+
+test("bootstrap safely resumes GitHub release creation without rewriting its pushed tag", () => {
+  withBootstrapPublishedBaseline((context, baselineHead) => {
+    const result = runBootstrap(context, baselineHead, {env: {GH_CREATE_FAIL: "1"}})
+
+    assertCliFailure(result, /GitHub release creation.*rerun the exact bootstrap/u)
+    assert.equal(revParse(context.origin, "v0.0.16^{commit}"), baselineHead)
+    assert.deepEqual(githubReleasesOf(context), [])
+    resumeBootstrapAfterFailure(context, baselineHead)
+  })
+})
+
+test("bootstrap is idempotent after the exact tag and GitHub release exist", () => {
+  withBootstrapPublishedBaseline((context, baselineHead) => {
+    let result = runBootstrap(context, baselineHead)
+    assert.equal(result.failure, undefined, result.output)
+
+    clearCommands(context)
+    result = runBootstrap(context, baselineHead)
+    assert.equal(result.failure, undefined, result.output)
+    assertBootstrapRetryDidNotRewrite(context, {includeRelease: true})
+    assertBootstrapRemoteState(context, baselineHead)
+  })
+})
+
+test("bootstrap verifies an exact release after GitHub loses the create response", () => {
+  withBootstrapPublishedBaseline((context, baselineHead) => {
+    const result = runBootstrap(context, baselineHead, {env: {GH_CREATE_FAIL_AFTER_WRITE: "1"}})
+
+    assert.equal(result.failure, undefined, result.output)
+    assert.equal(commandsOf(context).filter((command) => command.startsWith("gh release create")).length, 1)
+    assertBootstrapRemoteState(context, baselineHead)
+  })
+})
+
+test("bootstrap fails closed on an ambiguous GitHub lookup without attempting a release overwrite", () => {
+  withBootstrapPublishedBaseline((context, baselineHead) => {
+    const result = runBootstrap(context, baselineHead, {env: {GH_API_FAIL: "1"}})
+
+    assertCliFailure(result, /could not determine whether GitHub release v0\.0\.16 exists/u)
+    assert.equal(commandsOf(context).some((command) => command.startsWith("gh release create")), false)
+    assert.equal(revParse(context.origin, "v0.0.16^{commit}"), baselineHead)
+  })
+})
+
+test("bootstrap never overwrites a mismatched existing GitHub release", () => {
+  withBootstrapPublishedBaseline((context, baselineHead) => {
+    let result = runBootstrap(context, baselineHead, {env: {GH_CREATE_FAIL: "1"}})
+    assertCliFailure(result, /GitHub release creation/u)
+
+    writeFileSync(context.githubReleasesFile, JSON.stringify([
+      {tag_name: "v0.0.16", name: "wrong title", draft: false, prerelease: false}
+    ]))
+    clearCommands(context)
+    result = runBootstrap(context, baselineHead)
+
+    assertCliFailure(result, /GitHub release.*does not match/u)
+    assert.equal(commandsOf(context).some((command) => command.startsWith("gh release create")), false)
+    assert.deepEqual(githubReleasesOf(context), [
+      {tag_name: "v0.0.16", name: "wrong title", draft: false, prerelease: false}
+    ])
+  })
+})
 
 /**
  * Runs the guarded reconciliation mode and asserts it fails without release mutations.

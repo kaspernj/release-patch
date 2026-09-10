@@ -14,7 +14,7 @@ When run from a package's root directory, a normal patch release:
 2. Syncs `master` with `origin/master` (`git checkout master`, `git fetch`, then a fast-forward-only `git merge --ff-only origin/master`). If local `master` has diverged from `origin`, the sync fails loudly instead of inventing a merge commit that would then be tagged and published as a release.
 3. Reads and validates `package.json` **from the synced `master` checkout** (never stale feature-branch metadata): it must declare a `name` that npm itself accepts (validated with [`validate-npm-package-name`](https://www.npmjs.com/package/validate-npm-package-name), so scoped names pass and bad characters, capitals, length or reserved names fail) and must not be marked `"private": true`. A missing, invalid or private name fails here, before any release mutation.
 4. Logs in to npm if you are not already authenticated (`npm login`).
-5. Fetches tags (`git fetch origin --tags`) and enumerates them with `git for-each-ref`, keeping only **annotated** `vX.Y.Z` tag objects. Lightweight tags, pre-release/build tags and malformed tags are ignored — an annotated `v1.0.0` wins over a lightweight `v9.9.9`. The latest annotated tag is the current released baseline. If no valid annotated release tag exists, it fails clearly with bootstrap instructions instead of guessing.
+5. Fetches tags (`git fetch origin --tags`) and enumerates them with `git for-each-ref`, keeping only **annotated** `vX.Y.Z` tag objects. Lightweight tags, pre-release/build tags and malformed tags are ignored — an annotated `v1.0.0` wins over a lightweight `v9.9.9`. The latest annotated tag is the current released baseline. If no valid annotated release tag exists, it fails clearly with separate instructions for a brand-new package or an already-published no-tag package instead of guessing.
 6. Confirms the latest annotated tag is actually published on npm. A normal release never skips an unpublished latest tag: if the baseline tag is not on npm, it blocks with instructions to inspect it and, if it was tagged but never published, finish it with `release-patch --resume`.
 7. Derives the next version by incrementing the patch component of the published latest tag, and checks the registry for that exact `<package>@<version>` (`npm view <package>@<version> version`), passing the package name as a process argument, never through a shell. If that exact version already exists, it fails as a duplicate. Only an unambiguous npm `E404` code means the version is available; any other outcome — a network/auth/registry error, or an `E404` mixed with another error code — is treated as blocking uncertainty, and the release aborts before any mutation rather than risk an overwrite or a race.
 8. Installs dependencies (`npm install`, or `npm install --no-package-lock` when neither `package-lock.json` nor `npm-shrinkwrap.json` exists).
@@ -43,6 +43,39 @@ release-patch --resume
 ```
 
 `--resume` publishes the **existing** latest annotated tag without bumping, committing or creating another tag. It syncs `master`, requires the tag to be an ancestor of current master history, and requires current master's package name/version to match the tagged release identity. It then binds the exact synced master commit and annotated tag object, creates an isolated detached Git worktree at that tag's commit, validates the tagged manifest and re-runs the dependency, build and dry-run gates there. Immediately before the atomic push and again before publication, it requires both worktree HEAD and the clean tree to remain at that exact tagged commit. The non-force atomic push uses the validated object IDs as sources for `refs/heads/master` and the release tag, so concurrent local ref movement cannot change what reaches `origin` and conflicting remote movement is still rejected. This keeps later master changes out of the package while publishing and verifying the exact tagged version. The temporary worktree is removed and the caller's original branch or detached checkout is restored after every success or failure. SIGINT and SIGTERM are deferred through that cleanup and then re-delivered to preserve signal termination semantics; an accompanying release or cleanup error is still reported. If the version is already published, `--resume` is a verified no-op. Resume cannot be combined with another release mode.
+
+## Bootstrapping an already-published no-tag package
+
+Use this one-time mode when a package is already published on npm but its repository has never had a
+semver release tag:
+
+```sh
+release-patch --bootstrap-published 0.0.16 --expected-git-head 407db4fab09a941984614167a1377f773531949c
+```
+
+Both values are mandatory. The version must be exact stable `X.Y.Z`; the expected Git head must be a
+full 40-character lowercase SHA independently reviewed from authoritative package history. Run the
+command from a clean `master` that can fast-forward to and then exactly equals `origin/master`.
+
+Before changing release state, the helper fetches tags without pruning local state and fails unless
+there are no local or remote stable semver tags. It then reads `version` and `gitHead` together from
+npm for the exact package version and requires the registry values to match the supplied values. The
+commit must exist locally, be an ancestor of the verified current master commit, and contain a
+`package.json` whose name and version exactly match the current package and requested release.
+
+After all checks pass, `release-patch` creates annotated `v<version>` at the authenticated historical
+commit, pushes only that immutable tag object with a non-force exact refspec, verifies both the remote
+tag object and its peeled commit, and creates a public, non-prerelease GitHub release with the exact
+tag title. It never advances master or runs `npm publish` in this mode. Tagging current `HEAD` is wrong
+when npm's immutable `gitHead` names an older commit: it would make the Git release claim different
+source than the published artifact.
+
+Recovery is rerunning the exact same command. If a tag push has an uncertain outcome, the exact local
+tag is preserved. If the tag reached origin but GitHub release creation failed, the retry verifies the
+tag and finishes the release. The one exact annotated target tag is accepted as resumable state only
+when it still points to the authenticated commit; any other semver tag, moved/lightweight target tag,
+or mismatched existing GitHub release blocks. A retry never republishes npm, rewrites or force-pushes
+a tag, or edits/overwrites a release.
 
 ## Reconciling an untagged published baseline
 
@@ -125,6 +158,7 @@ npx release-patch
 - The package is a git repository with a `master` branch and an `origin` remote, and a clean working tree (no uncommitted changes) when you run the release.
 - `package.json` declares a `name` that npm accepts (validated with `validate-npm-package-name`) and is not marked `"private": true`.
 - At least one **annotated** release tag in `vX.Y.Z` form exists (for example `v1.0.0`), and that latest tag is published on npm. Lightweight tags are ignored. This published tag is the source of truth for the current released version. To bootstrap a brand-new package, see [Bootstrapping a brand-new package](#bootstrapping-a-brand-new-package).
+- An already-published package with no release tags instead uses [the guarded published-baseline bootstrap](#bootstrapping-an-already-published-no-tag-package), which also requires authenticated GitHub CLI access to create the matching GitHub release.
 - You have publish rights to the package on npm.
 
 ## License
