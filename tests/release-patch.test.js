@@ -238,8 +238,10 @@ const args = process.argv.slice(2)
 appendFileSync(process.env.COMMAND_LOG, "git " + args.join(" ") + "\\n")
 
 try {
-  if (args.join(" ") === "remote get-url --push origin" && process.env.GIT_ORIGIN_URL) {
-    process.stdout.write(process.env.GIT_ORIGIN_URL + "\\n")
+  if (args[0] === "remote" && args[1] === "get-url" && args.includes("--push") && process.env.GIT_ORIGIN_URL) {
+    const configuredUrls = (process.env.GIT_ORIGIN_URLS ?? process.env.GIT_ORIGIN_URL).split("\\n")
+    const returnedUrls = args.includes("--all") ? configuredUrls : configuredUrls.slice(0, 1)
+    process.stdout.write(returnedUrls.join("\\n") + "\\n")
     process.exit(0)
   }
   if (args.join(" ") === "fetch origin --tags" && process.env.GIT_ADVANCE_ORIGIN_MASTER_ON_TAG_FETCH) {
@@ -1545,6 +1547,23 @@ test("bootstrap rejects an origin that is not an unambiguous GitHub repository",
 
     assertCliFailure(result, /origin.*unambiguous GitHub repository/u)
     assertNoReleaseMutations(commandsOf(context))
+  })
+})
+
+test("bootstrap rejects multiple origin push URLs before release mutation", () => {
+  withBootstrapPublishedBaseline((context, baselineHead) => {
+    const result = runBootstrap(context, baselineHead, {
+      env: {
+        GIT_ORIGIN_URLS: [
+          "https://github.com/right-owner/right-repository.git",
+          "https://github.com/other-owner/other-repository.git"
+        ].join("\n")
+      }
+    })
+
+    assertCliFailure(result, /origin must have exactly one non-empty push URL/u)
+    assertNoReleaseMutations(commandsOf(context))
+    assert.ok(commandsOf(context).includes("git remote get-url --push --all origin"))
   })
 })
 

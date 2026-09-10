@@ -1040,14 +1040,26 @@ function isGitHubReleaseNotFound(output) {
 
 /** @returns {string} Origin's push URL. */
 function originPushUrl() {
+  let output
+
   try {
-    return runCaptureArgs("git", ["remote", "get-url", "--push", "origin"]).trim()
+    output = runCaptureArgs("git", ["remote", "get-url", "--push", "--all", "origin"])
   } catch (error) {
     throw new Error(
       "release-patch: could not read origin's push URL as an unambiguous GitHub repository; no release was created.",
       {cause: error}
     )
   }
+
+  const pushUrls = output.split("\n").map((url) => url.trim()).filter(Boolean)
+  if (pushUrls.length !== 1) {
+    throw new Error(
+      "release-patch: origin must have exactly one non-empty push URL before published-baseline bootstrap; " +
+      "no tag or GitHub release was created."
+    )
+  }
+
+  return pushUrls[0]
 }
 
 /**
