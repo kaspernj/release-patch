@@ -3,10 +3,20 @@ before_script:
 builds:
   build_1:
     name: Tests
+    paths:
+      - "**"
+      - "!README.md"
+      - "!docs/**"
+      - "!eslint.config.js"
+      - "!fallow-baselines/**"
     script:
       - npm test
   build_2:
     name: ESLint, Fallow & Typecheck
+    paths:
+      - "**"
+      - "!README.md"
+      - "!docs/**"
     script:
       - npm run eslint
       - npm run fallow:ci
